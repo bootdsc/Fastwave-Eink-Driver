@@ -222,12 +222,14 @@ improvement in the repo.
 
 Two boundaries:
 
-- **The datasheet maximum is the maximum. Do not go past it.** Above it, frame
-  rates do not improve at all and the extra contrast is marginal — the question
-  is closed, and there is nothing up there worth the risk to the panel. No
-  register values for it appear anywhere in this repository, and every port's
-  `volts` command refuses an out-of-spec value rather than writing it — so a
-  mistyped hex digit is an error message, not an overvoltage.
+- **The datasheet maximum is the maximum. Do not go past it.** ±17 V
+  (`0x4B` / `0x3A`) is the last legal step. **±18 V or anything higher causes
+  fast, permanent burn-in** — not the DC stain a scrub can lift, the film.
+  Frame rates do not improve up there and the extra contrast is not worth a
+  panel. No register values for it appear anywhere in this repository, and
+  every port's `volts` command refuses an out-of-spec value rather than
+  writing it — so a mistyped hex digit is an error message, not an
+  overvoltage. Do not add an 18 V option. Do not bypass the clamp.
 - **Voltage is not persistent.** A reset reverts to POR. So does anything that
   pulses RST, including your own recovery paths.
 

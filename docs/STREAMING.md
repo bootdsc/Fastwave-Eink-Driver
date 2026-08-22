@@ -1,5 +1,20 @@
 # Streaming video to the panel
 
+**Ink Flow** is the host GUI: `python tools/ink_flow.py`. The CLI is
+`python tools/webcam.py COMx`. Source can be a camera, a video, a still
+image, a GIF, or a screen region. **Send** starts the stream. While
+paused, **White out** / **Black out** run a drive-12 vendor full-clear and
+hold that colour; unpausing re-enters the stream so the picture comes back.
+
+Letterbox bars: prefer `--pad -1` (extend the picture edge). A solid white
+or black bar is idle ink — DISPLAY still scans it, skipped LUT phases dump
+DC into it, and an hour of that is burn-in. Solid bars still reverse-drive
+for a quarter-second each minute so they do not sit skipped. **Park white /
+Park black** run 8 vendor full-refresh flashes at drive 12, then hold.
+
+The full operator note — BB on stills, dark slow content, pause vs park vs
+leaving Send running — is [BURN-IN.md](BURN-IN.md).
+
 The clip cannot live on the device. 488 frames of packed 800x480 mono is 23 MB
 against 8 MB of flash. So the host decodes, crops, tone-maps, dithers, packs and
 delta-encodes, and the device only applies and displays.

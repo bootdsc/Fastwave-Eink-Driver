@@ -1,5 +1,6 @@
-"""fastwave host — live webcam / clip to e-ink.
+"""fastwave / Ink Flow host — live webcam / clip to e-ink.
 
+  python ink_flow.py
   python webcam.py COM19 --camera 1
   python webcam.py COM19 --source clip.mp4
   python webcam.py COM17 --panel crow-579 --source clip.mp4
@@ -78,6 +79,7 @@ PLANE = STRIDE * NH
 CHUNK = 48000
 TOKEN = bytes([0x06])
 CAN = bytes([0x18])
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 
 
 class Geo:
@@ -108,15 +110,16 @@ CONTRAST = 1.40
 WHITE_PT = 225
 # Below this: solid black, no dither. 0 left every dark area speckled.
 BLACK_PT = 40
-DITHER = 16
+DITHER = 4
 # 128 = 50/50 at mid-grey. Lower = more black cells (the 4x4 was too white).
 BIAS = 64
-DRIVE = 6
+DRIVE = 3
 # Reuse last bit if gray moved less than this — stops cam noise flipping
 # every pixel every frame.
 HOLD = 12
 INVERT = False
-# 115200 is the working CDC rate on this XIAO. 230400 also works. 921600 does not.
+# TinyUSB CDC ignores UART baud for throughput (USB FS bulk). 115200 is the
+# monitor rate. Host open uses the same number so a CH340 path still talks.
 BAUD = 115200
 # 4x4 clustered (16 steps). User set dither=16; 8x8/64 is CLUSTER8 in comments.
 # Values 0..15, same-byte neighbours stay together so static areas delta-drop.
@@ -216,6 +219,37 @@ def panel_fps(drive, geo=None):
     return 1000.0 / ((drive + 1) * 9.92 + 20.0)
 
 
+def _extend_edges(arr, ox, oy, nw, nh):
+    """Letterbox bars filled with the picture's edge pixels, not a solid field.
+
+    A solid white (or black) bar is idle ink. Every DISPLAY still scans it,
+    skipped LUT phases dump DC into it, and an hour of that is burn-in.
+    Repeating the edge row/column keeps those pixels in the same motion as
+    the frame, so they get a real drive when the picture moves.
+    """
+    out = np.array(arr, copy=True)
+    h, w = out.shape
+    ix0, iy0 = ox, oy
+    ix1, iy1 = ox + nw, oy + nh
+    if iy0 > 0:
+        out[:iy0, ix0:ix1] = out[iy0, ix0:ix1]
+    if iy1 < h:
+        out[iy1:, ix0:ix1] = out[iy1 - 1, ix0:ix1]
+    if ix0 > 0:
+        out[iy0:iy1, :ix0] = out[iy0:iy1, ix0:ix0 + 1]
+    if ix1 < w:
+        out[iy0:iy1, ix1:] = out[iy0:iy1, ix1 - 1:ix1]
+    if iy0 > 0 and ix0 > 0:
+        out[:iy0, :ix0] = out[iy0, ix0]
+    if iy0 > 0 and ix1 < w:
+        out[:iy0, ix1:] = out[iy0, ix1 - 1]
+    if iy1 < h and ix0 > 0:
+        out[iy1:, :ix0] = out[iy1 - 1, ix0]
+    if iy1 < h and ix1 < w:
+        out[iy1:, ix1:] = out[iy1 - 1, ix1 - 1]
+    return out
+
+
 def fit_wh(im, tw, th, letterbox=False, pad=0):
     if im.mode != "L":
         im = im.convert("L")
@@ -225,9 +259,14 @@ def fit_wh(im, tw, th, letterbox=False, pad=0):
         scale = min(tw / im.width, th / im.height)
         nw = max(1, int(im.width * scale + 0.5))
         nh = max(1, int(im.height * scale + 0.5))
+        ox, oy = (tw - nw) // 2, (th - nh) // 2
         im = im.resize((nw, nh), Image.BILINEAR)
-        canvas = Image.new("L", (tw, th), pad)
-        canvas.paste(im, ((tw - nw) // 2, (th - nh) // 2))
+        if int(pad) < 0:
+            canvas = Image.new("L", (tw, th), 0)
+            canvas.paste(im, (ox, oy))
+            return _extend_edges(np.asarray(canvas), ox, oy, nw, nh)
+        canvas = Image.new("L", (tw, th), int(pad) & 255)
+        canvas.paste(im, (ox, oy))
         return np.asarray(canvas)
     scale = max(tw / im.width, th / im.height)
     im = im.resize((max(tw, int(im.width * scale + 0.5)),
@@ -255,8 +294,10 @@ def compose_geo(im, knobs, geo):
           False = centre-crop to fill, edges lost
     zoom  percent, 100 = none. Crops a centred window first, so it composes
           with either fit mode: zoomed letterbox still shows bars.
-    pad   bar colour, 0 black / 255 white. On a mostly-white scene black bars
-          read as part of the picture, which is why it is a choice.
+    pad   0 black / 255 white / -1 extend (repeat edge pixels).
+          Solid bars are idle ink and DC-creep; extend is the long-run
+          option. Solid black/white still pulse to the opposite polarity
+          for ~0.25 s every minute so they do not sit skipped for an hour.
 
     All three are read per frame by the encoder thread, so they are live.
     """
@@ -269,6 +310,14 @@ def compose_geo(im, knobs, geo):
         left, top = (w - cw) // 2, (h - ch) // 2
         im = im.crop((left, top, left + cw, top + ch))
     pad = int(getattr(knobs, "pad", 0) or 0)
+    if knobs.fit and pad in (0, 255):
+        # Invert solid bars briefly so those pixels take a real B↔W round
+        # trip instead of a skipped LUT phase every frame.
+        t = time.time()
+        period = float(getattr(knobs, "bar_pulse_s", 60.0) or 60.0)
+        hold = float(getattr(knobs, "bar_pulse_hold", 0.25) or 0.25)
+        if period > 0 and (t % period) < hold:
+            pad = 255 - pad
     if geo.portrait and not knobs.landscape:
         return to_native(fit_wh(im, geo.lw, geo.lh, knobs.fit, pad=pad))
     return fit_wh(im, geo.nw, geo.nh, knobs.fit, pad=pad)
@@ -457,15 +506,73 @@ def park_rim(plane):
 
 
 def open_video(path):
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        return None
-    ok, f = cap.read()
-    if not ok or f is None:
+    """Open a file. Do not pre-decode a frame — that doubled start cost on 720p."""
+    backends = []
+    if hasattr(cv2, "CAP_FFMPEG"):
+        backends.append(cv2.CAP_FFMPEG)
+    backends.append(cv2.CAP_ANY)
+    for be in backends:
+        cap = cv2.VideoCapture(path, be)
+        if cap.isOpened():
+            return cap
         cap.release()
-        return None
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    return cap
+    return None
+
+
+def _src_max_edge(knobs):
+    geo = getattr(knobs, "geo", None)
+    if geo is None:
+        return 480
+    return min(960, max(geo.nw, geo.nh, geo.lw, geo.lh) * 2)
+
+
+def downscale_bgr(bgr, knobs):
+    """720p+ decode is wasted: the panel is 200..800 px. Shrink before PIL."""
+    h, w = bgr.shape[:2]
+    need = _src_max_edge(knobs)
+    m = max(h, w)
+    if m <= need:
+        return bgr
+    sc = need / float(m)
+    return cv2.resize(bgr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                      interpolation=cv2.INTER_AREA)
+
+
+def downscale_pil(im, knobs):
+    need = _src_max_edge(knobs)
+    w, h = im.size
+    m = max(w, h)
+    if m <= need:
+        return im
+    sc = need / float(m)
+    return im.resize((max(1, int(w * sc)), max(1, int(h * sc))), Image.BILINEAR)
+
+
+def _pil_rgb(im):
+    """Flatten palette/alpha onto white so a GIF frame is a real RGB picture."""
+    if im.mode == "RGB":
+        return im.copy()
+    if im.mode == "P":
+        im = im.convert("RGBA") if "transparency" in im.info else im.convert("RGB")
+    if im.mode == "RGBA":
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        return bg
+    return im.convert("RGB")
+
+
+def load_still_or_gif(path):
+    """Still image or animated GIF → (rgb_frames, delays_sec)."""
+    im = Image.open(path)
+    n = int(getattr(im, "n_frames", 1) or 1)
+    frames, delays = [], []
+    for i in range(n):
+        im.seek(i)
+        frames.append(_pil_rgb(im))
+        delays.append(max(0.02, float(im.info.get("duration", 100) or 100) / 1000.0))
+    if not frames:
+        raise ValueError("no frames")
+    return frames, delays
 
 
 def _quiet_cv():
@@ -581,25 +688,52 @@ def compose_source(im, knobs):
     return compose_geo(im, knobs, geo)
 
 
-def pick_screen_region():
-    """Drag a rectangle on a dim overlay. Esc cancels. F = whole virtual desktop."""
+def pick_screen_region(parent=None):
+    """Drag a rectangle. Esc cancels. F = whole virtual desktop.
+
+    Must be a Toplevel of the running app (not a second Tk() + nested
+    mainloop), and must be *opaque*. A layered/alpha overlay on Windows
+    delivers mouse-down and drag, then swallows mouse-up, so the box
+    vanished and nothing was stored.
+    """
     if tk is None:
         raise RuntimeError("tkinter missing; pass --region x,y,w,h instead")
     make_dpi_aware()
     vx, vy, vw, vh = virtual_screen()
     out = {"box": None}
 
-    root = tk.Tk()
-    root.overrideredirect(True)
-    root.geometry("%dx%d+%d+%d" % (vw, vh, vx, vy))
-    root.attributes("-topmost", True)
-    root.configure(bg="black")
-    root.attributes("-alpha", 0.32)
-    root.focus_force()
+    owned = parent is None
+    if owned:
+        win = tk.Tk()
+    else:
+        win = tk.Toplevel(parent)
+        win.transient(parent)
+    win.overrideredirect(True)
+    win.geometry("%dx%d+%d+%d" % (vw, vh, vx, vy))
+    try:
+        win.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    win.configure(bg="#101010")
 
-    cv = tk.Canvas(root, width=vw, height=vh, highlightthickness=0,
+    cv = tk.Canvas(win, width=vw, height=vh, highlightthickness=0,
                    bg="#101010", cursor="cross")
     cv.pack(fill="both", expand=True)
+
+    # Frozen desktop behind the rubber-band, so the window can stay opaque
+    # and still show what you are cropping.
+    try:
+        from PIL import ImageTk
+        shot = ImageGrab.grab(bbox=(vx, vy, vx + vw, vy + vh), all_screens=True)
+        if shot.mode != "RGB":
+            shot = shot.convert("RGB")
+        dim = (np.asarray(shot, dtype=np.uint16) * 38 // 100).astype(np.uint8)
+        photo = ImageTk.PhotoImage(Image.fromarray(dim, "RGB"))
+        win._photo = photo
+        cv.create_image(0, 0, image=photo, anchor="nw")
+    except Exception:
+        pass
+
     cv.create_text(
         vw // 2, 28, fill="#f2f2f2", font=("Segoe UI", 16, "bold"),
         text="Drag a rectangle  ·  release to capture  ·  F = full desktop  ·  Esc = cancel")
@@ -612,17 +746,20 @@ def pick_screen_region():
         return vx + int(x), vy + int(y)
 
     def show_size(x0, y0, x1, y1):
-        w, h = abs(x1 - x0), abs(y1 - y0)
         cv.coords(rect, x0, y0, x1, y1)
-        cv.itemconfigure(hint, text="%d × %d" % (w, h))
+        cv.itemconfigure(hint, text="%d × %d" % (abs(x1 - x0), abs(y1 - y0)))
 
     def finish(box):
         if box is not None:
             out["box"] = clamp_bbox(box)
-        root.destroy()
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        win.destroy()
 
     def on_down(e):
-        drag["x0"], drag["y0"], drag["on"] = e.x, e.y, True
+        drag["x0"], drag["y0"], drag["on"] = int(e.x), int(e.y), True
         show_size(e.x, e.y, e.x, e.y)
 
     def on_move(e):
@@ -634,7 +771,7 @@ def pick_screen_region():
             return
         drag["on"] = False
         x0, y0 = drag["x0"], drag["y0"]
-        x1, y1 = e.x, e.y
+        x1, y1 = int(e.x), int(e.y)
         if abs(x1 - x0) < 16 or abs(y1 - y0) < 16:
             cv.itemconfigure(hint, text="too small — drag again or press F / Esc")
             return
@@ -648,18 +785,24 @@ def pick_screen_region():
     def on_full(_e):
         finish((vx, vy, vx + vw, vy + vh))
 
-    cv.bind("<ButtonPress-1>", on_down)
-    cv.bind("<B1-Motion>", on_move)
-    cv.bind("<ButtonRelease-1>", on_up)
-    root.bind("<Escape>", on_esc)
-    root.bind("<F>", on_full)
-    root.bind("<f>", on_full)
-    cv.bind("<Escape>", on_esc)
-    cv.bind("<F>", on_full)
-    cv.bind("<f>", on_full)
-    root.grab_set()
+    for w in (win, cv):
+        w.bind("<ButtonPress-1>", on_down)
+        w.bind("<B1-Motion>", on_move)
+        w.bind("<ButtonRelease-1>", on_up)
+        w.bind("<Escape>", on_esc)
+        w.bind("<F>", on_full)
+        w.bind("<f>", on_full)
+    win.focus_force()
     cv.focus_set()
-    root.mainloop()
+    # Grab after focus; do not use a transparent layered window with grab.
+    try:
+        win.grab_set()
+    except tk.TclError:
+        pass
+    if owned:
+        win.mainloop()
+    else:
+        parent.wait_window(win)
     return out["box"]
 
 
@@ -697,8 +840,8 @@ class Knobs:
         self.black = args.black
         self.dither = args.dither
         self.bias = args.bias
-        self.trail = 7
-        self.chase = 2
+        self.trail = 0
+        self.chase = 0
         self.invert = args.invert
         self.mirror = not bool(args.no_mirror)
         self.fit = args.fit
@@ -711,8 +854,9 @@ class Knobs:
         if self.region == "":
             self.region = None
         self.panel = getattr(args, "panel", "auto")
-        self.bb = int(getattr(args, "bb", 0) or 0)
+        self.bb = int(getattr(args, "bb", 20))
         self.ww = int(getattr(args, "ww", 0) or 0)
+        self.equalize_min = int(getattr(args, "equalize_min", 0) or 0)
         self.geo = geo_for("xiao-426")
         self.wire = 2
         # Set by the handshake when it consumed frame 0's ACK.
@@ -766,21 +910,78 @@ class Cam(threading.Thread):
             im = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGRA2RGB))
         else:
             im = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        self._emit_pil(im)
+
+    def _emit_pil(self, im):
+        im = downscale_pil(im, self.knobs)
         self.latest_im = im
         self.latest = compose_source(im, self.knobs)
         self.grabs += 1
 
+    def _run_image(self, path):
+        try:
+            frames, delays = load_still_or_gif(path)
+        except Exception as e:
+            self.error = "no image %s: %s" % (path, e)
+            return
+        self.is_file = True
+        frames = [downscale_pil(f, self.knobs) for f in frames]
+        self.nframes = len(frames)
+        avg = sum(delays) / float(len(delays))
+        self.src_fps = (1.0 / avg) if avg > 0 else 10.0
+        n = len(frames)
+        if n == 1:
+            while self.running:
+                self._pos = 0
+                self._emit_pil(frames[0])
+                t_end = time.time() + 0.05
+                while self.running and time.time() < t_end:
+                    if self.knobs.paused:
+                        time.sleep(0.02)
+                    else:
+                        time.sleep(0.01)
+            return
+        origin = time.time()
+        idx = 0
+        while self.running:
+            if self.knobs.paused:
+                t_pause = time.time()
+                while self.running and self.knobs.paused:
+                    time.sleep(0.02)
+                origin += time.time() - t_pause
+                continue
+            with self._lock:
+                seek = self._seek
+                self._seek = None
+            if seek is not None:
+                idx = max(0, min(n - 1, seek))
+                origin = time.time()
+            self._pos = idx
+            self._emit_pil(frames[idx])
+            due = origin + delays[idx]
+            wait = due - time.time()
+            if wait > 0.002:
+                time.sleep(min(wait, delays[idx]))
+            origin = time.time()
+            idx = (idx + 1) % n
+
     def run(self):
         if isinstance(self.src, str) and not str(self.src).isdigit():
+            ext = os.path.splitext(self.src)[1].lower()
+            if ext in IMAGE_EXTS:
+                self._run_image(self.src)
+                return
             cap = open_video(self.src)
             if cap is None:
                 self.error = f"no video {self.src}"
                 return
             self.is_file = True
-            self.nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             self.src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
             if self.src_fps < 1.0:
                 self.src_fps = 30.0
+            # FRAME_COUNT on a long GOP file can scan the index. Do not block
+            # the first picture on it: start playback, fill nframes after.
+            self.nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         else:
             cap = open_camera(int(self.src))
             if cap is None:
@@ -794,14 +995,19 @@ class Cam(threading.Thread):
                     if not ok or bgr is None:
                         time.sleep(0.01)
                         continue
-                    self._emit(bgr)
+                    self._emit(downscale_bgr(bgr, self.knobs))
                 return
-            # File: wall-clock PTS. Panel fps only samples; movie length stays true.
+            # File: wall-clock movie PTS at src_fps, but only *decode* about
+            # as fast as the panel. 720p60 grab-skip was 2–3× slower than a
+            # small file because every skipped source frame was still decoded.
             origin = time.time()
             base = 0
             cur = 0
-            n = max(1, self.nframes)
+            n = max(0, self.nframes)
             rate = self.src_fps
+            geo = getattr(self.knobs, "geo", None)
+            pf = panel_fps(int(getattr(self.knobs, "drive", DRIVE)), geo)
+            show_fps = min(rate, max(pf * 1.2, 12.0))
             while self.running:
                 if self.knobs.paused:
                     t_pause = time.time()
@@ -818,20 +1024,16 @@ class Cam(threading.Thread):
                     base = seek
                     origin = time.time()
                 want = base + int((time.time() - origin) * rate)
-                if want >= n:
+                if n > 1 and want >= n:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     cur = 0
                     base = 0
                     origin = time.time()
                     want = 0
-                if want < cur or want > cur + 45:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, want)
-                    cur = want
-                else:
-                    while cur < want:
-                        if not cap.grab():
-                            break
-                        cur += 1
+                if want != cur:
+                    # Seek instead of grab-decoding every GOP frame we skip.
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, want))
+                    cur = max(0, want)
                 ok, bgr = cap.read()
                 cur += 1
                 if not ok or bgr is None:
@@ -842,8 +1044,8 @@ class Cam(threading.Thread):
                     time.sleep(0.01)
                     continue
                 self._pos = cur
-                self._emit(bgr)
-                due = origin + (cur - base) / rate
+                self._emit(downscale_bgr(bgr, self.knobs))
+                due = time.time() + (1.0 / show_fps)
                 wait = due - time.time()
                 if wait > 0.002:
                     time.sleep(min(wait, 0.08))
@@ -926,13 +1128,13 @@ def open_serial(port):
             s.timeout, s.write_timeout = 4, 8
             s.dtr = s.rts = False
             s.open()
-            time.sleep(0.35)
+            time.sleep(0.12)
             try:
                 s.write(CAN)
                 s.flush()
             except Exception:
                 pass
-            wait_bytes(s, b"STREAM done", 0.4)
+            wait_bytes(s, b"STREAM done", 0.2)
             # STATUS is the one authoritative statement of which env is
             # flashed. Drain a window and search the WHOLE blob rather than
             # stopping at the first newline after the word STATUS. That reply
@@ -942,12 +1144,12 @@ def open_serial(port):
             # xiao-426 and enter_stream refused the mismatch. A clean failure,
             # but a needless one, and it hit every other run.
             raw = b""
-            for _attempt in range(3):
+            for _attempt in range(2):
                 s.reset_input_buffer()
                 s.write(b"status\n")
                 s.flush()
                 quiet = time.time()
-                while time.time() - quiet < 0.35:
+                while time.time() - quiet < 0.15:
                     chunk = s.read(256)
                     if chunk:
                         raw += chunk
@@ -960,11 +1162,11 @@ def open_serial(port):
             return s
         except Exception as e:
             last = e
-            time.sleep(0.5)
+            time.sleep(0.25)
     raise last
 
 
-def wait_bytes(s, needle, timeout, to_nl=False):
+def wait_bytes(s, needle, timeout, to_nl=False, abort=None):
     """Read one byte at a time. Stop at needle, or at the newline after it.
 
     to_nl=True is required for STREAM ready: the host must see `wire=2` on
@@ -975,6 +1177,8 @@ def wait_bytes(s, needle, timeout, to_nl=False):
     t0 = time.time()
     found = False
     while time.time() - t0 < timeout:
+        if abort is not None and abort():
+            return False, buf
         b = s.read(1)
         if not b:
             continue
@@ -1081,9 +1285,17 @@ def enter_stream(s, knobs, do_white=True):
         s.write(("ww %d\n" % int(getattr(knobs, "ww", 0))).encode())
         wait_bytes(s, b"FAST", 2.0)
     if do_white:
-        s.write(b"white\n")
-        print("deghost (black/white cycles)…")
-        wait_bytes(s, b"OK white", 30.0)
+        # 1.54" `white` is a black/white SEQ_FULL deghost (~4 s) and stream
+        # entry only needs a known base. `white1` is one refresh. 4.26" has
+        # `white` as seed, not white1.
+        if knobs.panel == "xiao-154":
+            s.write(b"white1\n")
+            print("seed white…")
+            wait_bytes(s, b"OK white1", 8.0)
+        else:
+            s.write(b"white\n")
+            print("seed white…")
+            wait_bytes(s, b"OK white", 8.0)
     s.write(b"stream\n")
     wire, ack_pending, banner = stream_handshake(s, 8.0)
     if wire is None:
@@ -1117,6 +1329,200 @@ def leave_stream(s):
     except Exception:
         pass
     wait_bytes(s, b"STREAM done", 6.0)
+
+
+# Vendor full-refresh busy, measured. Each polarity is one drive cycle
+# (rails up, full LUT, rails down). 1.54" OTP 0xF7 = 2132 ms; 4.26" Mode 1
+# = 540 ms; 5.79" vendor path ~336 ms.
+EQUALIZE_MINS = (1, 5, 15, 30, 45, 60)
+FULL_REFRESH_MS = {
+    "xiao-154": 2132,
+    "xiao-426": 540,
+    "crow-579": 336,
+    "auto": 2132,
+}
+
+
+def equalize_drive_count(minutes, panel="auto"):
+    ms = FULL_REFRESH_MS.get(panel, 2132)
+    return max(1, int(round(float(minutes) * 60.0 * 1000.0 / ms)))
+
+
+def equalize_label(minutes, panel="auto"):
+    n = equalize_drive_count(minutes, panel)
+    return "%d min  (~%s drives)" % (int(minutes), format(n, ","))
+
+
+def equalize_panel(port, minutes, panel="auto", log=None, should_stop=None,
+                   on_status=None):
+    """Cycle solid black/white on the vendor full sequence (rails up/down).
+
+    Drive is set to 12 first. Loop until `minutes` elapse or should_stop.
+    Each polarity counts as one drive. Ends on white.
+    """
+    def say(msg):
+        if log is not None:
+            log(msg)
+        print(msg)
+
+    def stopped():
+        return should_stop is not None and should_stop()
+
+    minutes = int(minutes)
+    if minutes not in EQUALIZE_MINS:
+        minutes = min(EQUALIZE_MINS, key=lambda m: abs(m - minutes))
+    panel = detect_panel(port, panel)
+    expect = equalize_drive_count(minutes, panel)
+    s = serial.Serial()
+    s.port, s.baudrate = port, BAUD
+    s.timeout, s.write_timeout = 0.2, 8
+    s.dtr = s.rts = False
+    try:
+        s.open()
+    except Exception as e:
+        return "cannot open %s: %s" % (port, e)
+    drives = 0
+    t_end = time.time() + minutes * 60.0
+    try:
+        time.sleep(0.15)
+        try:
+            s.write(CAN)
+            s.flush()
+        except Exception:
+            pass
+        wait_bytes(s, b"STREAM done", 2.0, abort=stopped)
+        s.reset_input_buffer()
+        s.write(b"status\n")
+        _ok, raw = wait_bytes(s, b"STATUS", 3.0, abort=stopped)
+        reported = panel_from_text(raw)
+        if reported:
+            panel = reported
+            expect = equalize_drive_count(minutes, panel)
+        s.write(b"drive 12\n")
+        wait_bytes(s, b"OK drive", 3.0, abort=stopped)
+        say("equalize: drive 12, vendor full rails, %d min (~%s drives) %s"
+            % (minutes, format(expect, ","), panel))
+
+        def one(cmd, needle, timeout):
+            if stopped():
+                return False
+            s.reset_input_buffer()
+            s.write((cmd + "\n").encode())
+            s.flush()
+            ok, _raw = wait_bytes(s, needle, timeout, abort=stopped)
+            return ok
+
+        while time.time() < t_end and not stopped():
+            left = max(0, int(t_end - time.time()))
+            if on_status:
+                on_status("equalize %d:%02d left  %s drives  mode 12 full"
+                          % (left // 60, left % 60, format(drives, ",")))
+            if panel == "xiao-154":
+                if not one("black", b"OK black", 8.0):
+                    break
+                drives += 1
+                if stopped() or time.time() >= t_end:
+                    break
+                if not one("white1", b"OK white1", 8.0):
+                    break
+                drives += 1
+            elif panel == "xiao-426":
+                if not one("deghost 1", b"DEGHOST done", 12.0):
+                    break
+                drives += 2
+            else:
+                if not one("flush 1", b"OK flush", 20.0):
+                    break
+                drives += 2
+        if panel == "xiao-154":
+            one("white1", b"OK white1", 8.0)
+        elif panel == "xiao-426":
+            one("white", b"OK white", 8.0)
+        say("equalize done %s drives (est %s)" % (format(drives, ","),
+                                                  format(expect, ",")))
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def park_panel(port, color="white", cycles=8, panel="auto", log=None):
+    """Stop whatever is running, deghost, hold white or black.
+
+    Clearing flashes are the vendor full-refresh path — a differential
+    update never lifts idle residue. Drive is set to 12 first (strongest
+    custom table) so a later stream re-entry is not sitting on a weak
+    mode. 5–10 cycles; default 8.
+    """
+    def say(msg):
+        if log is not None:
+            log(msg)
+        print(msg)
+
+    color = "black" if str(color).lower().startswith("b") else "white"
+    cycles = max(5, min(10, int(cycles)))
+    panel = detect_panel(port, panel)
+    s = serial.Serial()
+    s.port, s.baudrate = port, BAUD
+    s.timeout, s.write_timeout = 4, 8
+    s.dtr = s.rts = False
+    try:
+        s.open()
+    except Exception as e:
+        return "cannot open %s: %s" % (port, e)
+    try:
+        time.sleep(0.3)
+        try:
+            s.write(CAN)
+            s.flush()
+        except Exception:
+            pass
+        wait_bytes(s, b"STREAM done", 2.0)
+        s.reset_input_buffer()
+        s.write(b"status\n")
+        _ok, raw = wait_bytes(s, b"STATUS", 3.0)
+        reported = panel_from_text(raw)
+        if reported:
+            panel = reported
+        s.write(b"drive 12\n")
+        wait_bytes(s, b"OK drive", 3.0)
+        say("park: drive 12, %d flashes, hold %s (%s)" % (cycles, color, panel))
+        if panel == "xiao-154":
+            s.write(("scrub %d\n" % cycles).encode())
+            ok, raw = wait_bytes(s, b"OK scrub", 90.0)
+            if not ok:
+                return "scrub timed out:\n" + raw.decode("utf-8", "replace")[-200:]
+        elif panel == "xiao-426":
+            n = min(cycles, 8)
+            s.write(("deghost %d\n" % n).encode())
+            ok, raw = wait_bytes(s, b"DEGHOST done", 90.0)
+            if not ok:
+                return "deghost timed out:\n" + raw.decode("utf-8", "replace")[-200:]
+        else:
+            s.write(("flush %d\n" % cycles).encode())
+            ok, raw = wait_bytes(s, b"OK flush", 90.0)
+            if not ok:
+                return "flush timed out:\n" + raw.decode("utf-8", "replace")[-200:]
+        if color == "black":
+            if panel == "crow-579":
+                say("park: 5.79\" flush ends white — no black hold on that port")
+                return None
+            s.write(b"black\n")
+            ok, raw = wait_bytes(s, b"OK black", 30.0)
+            if not ok:
+                return "black timed out:\n" + raw.decode("utf-8", "replace")[-200:]
+        elif panel == "xiao-426":
+            s.write(b"white\n")
+            wait_bytes(s, b"OK white", 30.0)
+        say("parked %s" % color)
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def port_hwid(port):
@@ -1190,7 +1596,8 @@ def leave_stream_crow(s):
     wait_bytes(s, b"STREAM done", 6.0)
 
 
-def encode_one(src, prev, prev_g, prev_bit, knobs, geo, tone_lut, thresh, fps_plate):
+def encode_one(src, prev, prev_g, prev_bit, knobs, geo, tone_lut, thresh,
+               fps_plate, skip_hold=False):
     g = tone_lut[np.clip(src, 0, 255)]
     if fps_plate is not None:
         g = g.copy()
@@ -1198,7 +1605,7 @@ def encode_one(src, prev, prev_g, prev_bit, knobs, geo, tone_lut, thresh, fps_pl
     bit = g > thresh
     bit = np.where(g <= knobs.black, False, bit)
     bit = np.where(g >= knobs.white, True, bit)
-    if prev_g is not None:
+    if (not skip_hold) and prev_g is not None:
         hold = np.abs(g.astype(np.int16) - prev_g.astype(np.int16)) < HOLD
         bit = np.where(hold, prev_bit, bit)
     if knobs.invert:
@@ -1254,10 +1661,13 @@ def xiao_stream_body(s, knobs, cam, ctl, poll=None):
                 time.sleep(0.004)
                 continue
             src = np.array(src, copy=True)
+            skip_hold = bool(state.get("skip_hold"))
+            if skip_hold:
+                state["skip_hold"] = False
             cur, g, bit, bmp, lit = encode_one(
                 src, state["prev"], state["prev_g"], state["prev_bit"],
                 knobs, geo, state["tone_lut"], state["thresh"],
-                state["fps_plate"])
+                state["fps_plate"], skip_hold=skip_hold)
             packed = (cur, g, bit, bmp, lit)
             while not enc_stop.is_set():
                 try:
@@ -1287,6 +1697,13 @@ def xiao_stream_body(s, knobs, cam, ctl, poll=None):
                         knobs.dither, knobs.bias, geo.nh, geo.nw)
                     state["tone_lut"] = build_lut(
                         knobs.gamma, knobs.contrast, knobs.white, knobs.black)
+                    state["skip_hold"] = True
+                    state["prev_g"] = None
+                    state["prev_bit"] = None
+                    state["frozen"] = None
+            if getattr(ctl, "_hold_color", None):
+                why = "hold"
+                break
             if getattr(ctl, "_white", False) or getattr(ctl, "_rearm", False):
                 why = "white" if ctl._white else "rearm"
                 ctl._white = ctl._rearm = False
@@ -1303,6 +1720,12 @@ def xiao_stream_body(s, knobs, cam, ctl, poll=None):
                     knobs.dither, knobs.bias, geo.nh, geo.nw)
                 state["tone_lut"] = build_lut(
                     knobs.gamma, knobs.contrast, knobs.white, knobs.black)
+                # HOLD was swallowing still/GIF slider moves (gray moved < 12).
+                # Next frame is a real delta of the new tone, no reconnect.
+                state["skip_hold"] = True
+                state["prev_g"] = None
+                state["prev_bit"] = None
+                state["frozen"] = None
             try:
                 _cur, _g, _bit, bmp, lit = out_q.get(timeout=0.05)
             except queue.Empty:
@@ -1524,12 +1947,12 @@ def main():
     ap.add_argument("port")
     ap.add_argument("--panel", default="auto",
                     choices=("auto", "xiao-426", "xiao-154", "crow-579"),
-                    help="auto = USB id (303A Xiao 4.26, 1A86 CrowPanel CH340). "
-                         "xiao-154 is packing only until that env is flashed")
+                    help="auto = USB id (303A Xiao, 1A86 CrowPanel CH340). "
+                         "xiao-154 = Watchy 200x200")
     ap.add_argument("--camera", type=int, default=1,
                     help="cv2 camera index; --list to enumerate")
     ap.add_argument("--source", default="",
-                    help="video file path; loops; overrides --camera")
+                    help="video / gif / image path; loops; overrides --camera")
     ap.add_argument("--drive", type=int, default=DRIVE,
                     help="Mode 2 drive_tp (waveform frames)")
     ap.add_argument("--test", action="store_true",
@@ -1549,7 +1972,7 @@ def main():
     ap.add_argument("--zoom", type=int, default=100,
                     help="percent, 100 = none; crops a centred window first")
     ap.add_argument("--pad", type=int, default=0,
-                    help="letterbox bar level, 0 black / 255 white")
+                    help="letterbox bars: 0 black, 255 white, -1 extend (edge pixels)")
     ap.add_argument("--landscape", action="store_true")
     ap.add_argument("--no-mirror", action="store_true")
     ap.add_argument("--invert", dest="invert", action="store_true",
@@ -1699,6 +2122,7 @@ class LiveStream:
         self._rearm = False
         self._white = False
         self._tone = False
+        self._hold_color = None
         self._cmds = []
         # Ring of device text for a UI to display. Bounded so a long session
         # cannot grow without limit.
@@ -1784,6 +2208,20 @@ class LiveStream:
     def request_white(self):
         self._white = True
 
+    def request_hold(self, color):
+        """While paused: leave the stream, full-clear to white or black at drive 12."""
+        self._hold_color = "black" if str(color).lower().startswith("b") else "white"
+
+    def park(self, color="white", cycles=8):
+        """Leave the stream, deghost, hold white or black. Blocks."""
+        self.stop()
+        t0 = time.time()
+        while self._th is not None and self._th.is_alive() and time.time() - t0 < 6:
+            time.sleep(0.05)
+        self.running = False
+        return park_panel(self.port, color=color, cycles=cycles,
+                          panel=self.panel, log=self.conlog.append)
+
     def request_tone(self):
         self._tone = True
 
@@ -1803,9 +2241,26 @@ class LiveStream:
             panel = detect_panel(self.port, self.panel)
             knobs.panel = panel
             knobs.geo = geo_for(panel)
+            if int(getattr(knobs, "equalize_min", 0) or 0) > 0:
+                self.status = "equalize…"
+                err = equalize_panel(
+                    self.port, knobs.equalize_min, panel=self.panel,
+                    log=self.conlog.append,
+                    should_stop=lambda: not self.running,
+                    on_status=lambda m: setattr(self, "status", m),
+                )
+                if err:
+                    self.error = err
+                    self.status = err
+                elif self.running:
+                    self.status = "equalize done"
+                else:
+                    self.status = "equalize stopped"
+                return
             if panel == "crow-579":
                 knobs.mirror = False
-            if isinstance(self.source, str) and self.source                     and not str(self.source).isdigit():
+            if (isinstance(self.source, str) and self.source
+                    and not str(self.source).isdigit()):
                 knobs.mirror = False   # file source: do not flip the movie
             self.status = "opening source…"
             if knobs.screen:
@@ -1873,6 +2328,42 @@ class LiveStream:
                     if not enter_stream(s, knobs, do_white=(why == "white")):
                         self.error = "rearm failed"
                         break
+                    continue
+                if why == "hold":
+                    color = self._hold_color or "white"
+                    self._hold_color = None
+                    leave_stream(s)
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    self.status = "holding %s (drive 12 full clear)…" % color
+                    err = park_panel(self.port, color=color, cycles=8,
+                                     panel=knobs.panel, log=self.conlog.append)
+                    self.status = err or ("paused, held %s" % color)
+                    while self.running and knobs.paused:
+                        nxt = self._hold_color
+                        if nxt:
+                            self._hold_color = None
+                            self.status = "holding %s (drive 12 full clear)…" % nxt
+                            err = park_panel(self.port, color=nxt, cycles=8,
+                                             panel=knobs.panel,
+                                             log=self.conlog.append)
+                            self.status = err or ("paused, held %s" % nxt)
+                        time.sleep(0.05)
+                    if not self.running:
+                        break
+                    self.status = "restoring…"
+                    s = open_serial(self.port)
+                    if not confirm_panel(s, knobs, self.panel):
+                        self.error = "panel mismatch on restore"
+                        self.status = self.error
+                        break
+                    if not enter_stream(s, knobs, do_white=True):
+                        self.error = "restore failed"
+                        self.status = self.error
+                        break
+                    self.status = "streaming (restored)"
                     continue
         finally:
             try:

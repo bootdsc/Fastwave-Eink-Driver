@@ -1,8 +1,13 @@
 # art
 
-`fastwave-hero.png` — 256x512, four grey levels, no dithering. Black, two
-intermediate states, white: what an SSD16xx gives you natively before any
-spatial screen is applied.
+`ink-flow-glass.jpg` — still from the 1.54" port playing a clip. Bench photo,
+not a render.
+
+`ink-flow-app.png` — the Ink Flow host GUI.
+
+`fastwave-hero.png` — grayscale test. 256x512, four grey levels, no dithering.
+Black, two intermediate states, white: what an SSD16xx gives you natively
+before any spatial screen is applied.
 
 `fastwave-hero.ppix` — the same pixels as a PixelPerfect project, one layer,
 five-entry palette (slot 0 is that editor's transparent slot and is unused, so

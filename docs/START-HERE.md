@@ -22,9 +22,21 @@ coding agent and let it interview you about your wiring.
 
 ### "I want video on e-paper."
 
+**Ink Flow** is the host: `python tools/ink_flow.py` (webcam, a file, or a
+screen region). Flash the matching port first. The CLI is
+`python tools/webcam.py COMx`.
+
 [STREAMING.md](STREAMING.md) for the wire and the pipeline.
 [PICTURE.md](PICTURE.md) for why the dither matrix is a hardware decision and
 not a taste one. Both matter; the second one is the surprise.
+
+### "I am going to leave a picture on the glass for a while."
+
+[BURN-IN.md](BURN-IN.md). This driver is experimental and out of spec: one
+minute of video is on the order of a five-year warranty's refreshes. Solid
+letterbox bars, a still left in the stream loop, and BB redrive on dark slow
+content stain the glass. Restore is hours of full black/white (`scrub` /
+`blink` / Park), not one differential frame.
 
 ### "My picture looks wrong and I don't know why."
 
@@ -53,6 +65,7 @@ has touched them.
 | [WAVEFORM-LAW.md](WAVEFORM-LAW.md) | The timing equation, the `0x22` bitfield, the LUT anatomy, where the time goes. The core. |
 | [PROBES.md](PROBES.md) | `calib`, `seqscan`, `bytescan`, `probe`, and the bring-up ladder. |
 | [PITFALLS.md](PITFALLS.md) | Failure modes and their mechanisms. |
+| [BURN-IN.md](BURN-IN.md) | DC stain, letterbox bars, BB on stills / dark slow content. |
 | [PICTURE.md](PICTURE.md) | Dither, tone, and native greyscale. |
 | [STREAMING.md](STREAMING.md) | Host-to-device video: protocol, compression, pacing. |
 | [MEASURING.md](MEASURING.md) | How to measure this without fooling yourself. |

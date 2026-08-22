@@ -70,6 +70,10 @@ doing because it proves the mechanism rather than just the fix.
 VCOM is a **DC-balance** control, not a contrast control. Reach for the source
 rails for contrast.
 
+It is not enough on its own for a long run with a static field. Letterbox
+bars, a still left streaming, and high BB on dark slow content are in
+[BURN-IN.md](BURN-IN.md).
+
 ## Bit 4 of `0x22` silently reloads the factory waveform
 
 Covered in [WAVEFORM-LAW.md](WAVEFORM-LAW.md) §4, repeated here because it is

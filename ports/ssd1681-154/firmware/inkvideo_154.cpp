@@ -735,7 +735,8 @@ static void print_help(void) {
   Serial.println("  inv 0|1     swap which rail drives toward black");
   Serial.println("  map A B     which LUT blocks are to-black / to-white");
   Serial.println("  vcom X      0x08 = -0.2V, the DC-creep fix");
-  Serial.println("  volts A B   VSH1 VSL hex (POR 41 32 = +/-15V)");
+  Serial.println("  volts A B   VSH1 VSL hex (POR 41 32 = +/-15V, max 4B 3A = +/-17V)");
+  Serial.println("              NEVER +/-18 or above: fast permanent burn-in");
   Serial.println("  trail N | chase N");
   Serial.println("  drive/volts/settle accepted, no custom LUT on glass yet");
 }
@@ -1005,7 +1006,8 @@ static void handle_cmd(char *s) {
           g_wp.vsl = (uint8_t)b;
           if (g_wave_on) arm_wave();
         } else {
-          Serial.println("  out of spec: VSH1 0x21..0x4B, VSL 0x0A..0x3A");
+          Serial.println("  out of spec: VSH1 0x21..0x4B (+8.6..+17V), VSL 0x0A..0x3A (-5..-17V)");
+          Serial.println("  NEVER +/-18V or above: fast permanent burn-in");
         }
       }
     }

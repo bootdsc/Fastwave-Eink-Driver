@@ -84,7 +84,22 @@ Trail chasing is the candidate.
 
 VCOM is at the value that fixed it on one panel. It has not been verified over a
 long run on the others: stream for several minutes, refresh to white, and check
-the field is still clean.
+the field is still clean. Operator note (bars, BB on stills, dark slow
+content): [BURN-IN.md](BURN-IN.md).
+
+## Ink Flow leftovers (packaging, not waveform)
+
+The host lives at `tools/ink_flow.py`. Bounce list so it is not dropped:
+
+- YouTube clip URL still empty on the README.
+- App screenshot is `art/ink-flow-app.png` at the top of the README (refreshed).
+  The four-level plate is at the bottom, labeled grayscale test.
+- Region picker, park, and bar-extend/pulse are coded, not re-verified on glass
+  this pass.
+- 1.54" white letterbox, ~1 hour of Bad Apple, left visible burn-in. That is
+  the DC-creep case below, made worse by a static solid field. Extend bars are
+  the long-run option; solid bars now reverse-drive 0.25 s/min.
+- Nothing here has been pushed.
 
 ## One unexplained BUSY timeout
 

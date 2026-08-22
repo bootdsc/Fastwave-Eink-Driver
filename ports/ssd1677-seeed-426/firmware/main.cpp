@@ -1762,10 +1762,12 @@ static void handle_cmd(char *s)
     // frame count is identical and the contrast difference is marginal.
     if (n >= 1 && (a < 0x23 || a > 0x4B)) {
       Serial.println("ERR vsh1 0x23..0x4B (9..17 V) - datasheet range");
+      Serial.println("NEVER +/-18V or above: fast permanent burn-in");
       return;
     }
     if (n >= 2 && (b2 < 0x1A || b2 > 0x3A)) {
       Serial.println("ERR vsl 0x1A..0x3A (-9..-17 V) - datasheet range");
+      Serial.println("NEVER +/-18V or above: fast permanent burn-in");
       return;
     }
     if (n >= 4 && d > 0x17) {
