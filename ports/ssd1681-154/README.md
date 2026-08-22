@@ -14,6 +14,8 @@ contrast 121. Five times faster and better ink.**
 | serial | 115200 |
 | planes | 5000 bytes each |
 
+Pins and geometry are in `firmware/board.h` — one header, this panel only.
+
 **Check the flex-cable pinout against your breakout before plugging the panel
 in.** A 24-pin e-paper connector is not a standard, and the two boards this was
 tried on did not agree.

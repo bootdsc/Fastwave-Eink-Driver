@@ -2458,7 +2458,10 @@ static void stream_rx_task(void *) {
     uint8_t got_ck = 0;
     for (uint32_t i = 0; i < STREAM_BMP_BYTES; i++) got_ck ^= s->bmp[i];
     for (uint32_t i = 0; i < s->paylen; i++) got_ck ^= s->pay[i];
-    if (got_ck != want_ck) g_stream_bad++;
+    // Written only here, on the receive task; read by the reporter. Spelled
+    // out rather than `++` because incrementing a volatile is deprecated in
+    // C++20 and the warning is not worth leaving in a reference tree.
+    if (got_ck != want_ck) g_stream_bad = g_stream_bad + 1;
     xSemaphoreGive(g_sem_ready);
     cur ^= 1;
   }

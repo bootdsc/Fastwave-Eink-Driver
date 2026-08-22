@@ -1,5 +1,5 @@
-#ifndef _BOARD_154_H_
-#define _BOARD_154_H_
+#ifndef _BOARD_H_
+#define _BOARD_H_
 
 // Seeed XIAO ESP32-S3 + Seeed ePaper breakout, Watchy 1.54" glass.
 // Panel: Good Display GDEH0154D67 (HINK-E154A07-A1), 200x200 mono, SSD1681.
