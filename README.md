@@ -58,6 +58,13 @@ frames.
   <img src="art/ink-flow-glass.jpg" width="720" alt="1.54-inch e-paper on a Seeed XIAO ESP32-S3 playing a silhouette video, flex cable to the panel, marker in the foreground.">
 </p>
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=9FRypKoAvRs">
+    <img src="https://img.youtube.com/vi/9FRypKoAvRs/maxresdefault.jpg" width="560" alt="Demo video: Ink Flow streaming to the 1.54-inch panel.">
+  </a>
+  <br><em>Demo video &mdash; 1.54" glass, live stream (YouTube)</em>
+</p>
+
 ```
 python tools/ink_flow.py
 ```
