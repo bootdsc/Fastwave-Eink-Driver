@@ -108,6 +108,11 @@ two ports are original.
 
 Hardware named here is named because it is what was on the bench. Nothing in
 this repository is endorsed by, or affiliated with, any of the manufacturers
-involved, and one of the panels used was measurably defective — see the note in
-its panel document, because a defect you know about is worth more than a clean
-result you cannot reproduce.
+involved.
+
+One of the panels used had a genuine manufacturing fault, and the note about it
+is kept because it cost a session: the symptom looked exactly like a waveform
+problem and every waveform explanation for it was wrong. Voltages stay inside
+the datasheet throughout — the source rails go to the specified maximum and no
+further, and every port's `volts` command refuses an out-of-spec value rather
+than writing it.

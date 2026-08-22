@@ -2897,9 +2897,15 @@ static void handle_cmd(char *s) {
   if (set_wave_byte(s, "settle", &g_wp.settle_tp, 0, 63)) return;
   if (set_wave_byte(s, "rp", &g_wp.rp, 1, 255)) return;
   if (set_wave_byte(s, "sr", &g_wp.sr_ab, 1, 255)) return;
-  if (set_wave_byte(s, "vsh1", &g_wp.vsh1, 0, 255)) return;
-  if (set_wave_byte(s, "vsh2", &g_wp.vsh2, 0, 255)) return;
-  if (set_wave_byte(s, "vsl", &g_wp.vsl, 0, 255)) return;
+  // Upper bounds are the datasheet maxima: VSH1/VSH2 0x4B = 17 V, VSL 0x3A =
+  // -17 V. They used to accept 0..255, which let a typo drive the panel out of
+  // spec with no warning and no benefit — above the maximum the frame count is
+  // unchanged and the extra contrast is marginal, so there is nothing up there
+  // to reach for. Lower bounds stay open: under-driving is a legitimate
+  // experiment, over-driving is not.
+  if (set_wave_byte(s, "vsh1", &g_wp.vsh1, 0, 0x4B)) return;
+  if (set_wave_byte(s, "vsh2", &g_wp.vsh2, 0, 0x4B)) return;
+  if (set_wave_byte(s, "vsl", &g_wp.vsl, 0, 0x3A)) return;
   if (set_wave_byte(s, "vcom", &g_wp.vcom, 0, 255)) return;
   if (set_wave_byte(s, "vgh", &g_wp.vgh, 0, 255)) return;
   if (set_wave_byte(s, "eopt", &g_wp.eopt, 0, 255)) return;

@@ -31,7 +31,8 @@ the total and a wall-clock frame rate, plus one moving disc.
 
 ```
 spi          20 MHz hardware, set once in setup()
-volts        VSH1 0x4B  VSL 0x3A   (+/-17 V, datasheet max)
+volts        VSH1 0x4B  VSL 0x3A   (+/-17 V, datasheet max; vsh1/vsh2/vsl
+             refuse anything above it)
 vcom         0x08                  (-0.2 V — stops the panel creeping dark)
 fr           0x05                  (125 Hz, 8.11 ms/frame)
 activate     0x0C after 0xC0       (rails up once, then display only)

@@ -222,10 +222,12 @@ improvement in the repo.
 
 Two boundaries:
 
-- **+/-18 V (`0x50` / `0x3E`) is out of spec.** It was tried once, on a panel
-  already known to be defective and destined for replacement. Frame rates were
-  identical and the extra contrast was marginal. Not worth it, and not
-  something to try on a panel you care about.
+- **The datasheet maximum is the maximum. Do not go past it.** Above it, frame
+  rates do not improve at all and the extra contrast is marginal — the question
+  is closed, and there is nothing up there worth the risk to the panel. No
+  register values for it appear anywhere in this repository, and every port's
+  `volts` command refuses an out-of-spec value rather than writing it — so a
+  mistyped hex digit is an error message, not an overvoltage.
 - **Voltage is not persistent.** A reset reverts to POR. So does anything that
   pulses RST, including your own recovery paths.
 

@@ -182,8 +182,10 @@ detail is already correct. Gamma cannot do that; it moves everything.
 - **Default `4B 3A` = +/-17 V**, the datasheet maximum. Visibly darker blacks, and
   the benefit grows the faster the mode. Costs nothing in time: voltage sets how
   hard a pixel is driven, not how long.
-- `50 3E` = +/-18 V was tried **out of spec** on a prototype panel. Frame rates
-  identical, extra contrast marginal. Not worth it.
+- **Above +/-17 V is out of spec, and there is nothing there.** Frame rates do
+  not change and the extra contrast is marginal. Treat the datasheet maximum as
+  the ceiling — `volts` refuses anything outside the datasheet range rather than
+  writing it.
 
 Voltage is not persistent — the board reverts to stock on reset.
 
@@ -209,8 +211,13 @@ transition and restores the ramp.
 
 Two adjacent gate lines on this panel switch symmetrically slowly (~500 ms) and
 only reach 80-90% black. Reproduced on the vendor waveform, on both SPI
-transports, at maximum VGH. Concluded defective; Seeed to replace. The unit is
-being kept for prototyping, which is why +/-18 V was acceptable to try on it.
+transports, at maximum in-spec VGH. Concluded defective; replaced under
+warranty.
+
+The reason this is written down: for most of a session those two lines looked
+like a waveform problem, and every waveform explanation for them was wrong.
+A fault that survives the vendor waveform, both SPI transports and every
+voltage in spec is hardware. Stop tuning and check the glass.
 
 ## Build
 

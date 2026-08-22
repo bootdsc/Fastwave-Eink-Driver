@@ -76,9 +76,11 @@ by looking at the panel from the side.
    slowly. A working slow reference is worth more than a datasheet.
 9. **Colour** — black and white, or does the panel have a third pigment. Three-
    pigment panels are a different problem and this library is not it.
-10. **Risk appetite** — is this panel replaceable. Some measurements in the
-    reference material were taken at voltages outside the datasheet, on a panel
-    that was already destined for the bin. Say so now if yours is not.
+10. **Provenance** — is this glass known-good, or is anything about it already
+    suspect. Asked so that a manufacturing fault is not mistaken for a waveform
+    problem, which has happened and cost a session. Not so that anything gets
+    driven harder: the datasheet maximum is the ceiling regardless of the
+    answer.
 11. **Serial port** — the port name, and whether anything else currently has it
     open.
 
@@ -119,9 +121,10 @@ Now, and only now. Follow `docs/WAVEFORM-LAW.md`:
   switch the ink harder than more shorter ones for the same total time, so the
   fastest available frame rate is frequently not the right one.
 - Rails up once; bare DISPLAY byte per frame.
-- Source rails at the datasheet maximum. This is free contrast and costs no
-  time. It is also the only lever in the entire subject that is unambiguously
-  worth pulling without measuring first.
+- Source rails at the datasheet maximum, and not one step further. Up to the
+  maximum this is free contrast at no time cost — the only lever here that is
+  unambiguously worth pulling without measuring first. Past the maximum it buys
+  nothing at all.
 - Only the two changing transition blocks. The other two stay at zero, or static
   content is driven on every update and the picture slowly dissolves.
 - Re-arm after anything that sets bit 4.
@@ -152,8 +155,13 @@ Write, in the new port's directory:
 ## Rules that are not negotiable
 
 - **Ask before flashing, before opening a serial port, and before changing any
-  panel voltage.** Never exceed the datasheet unless the user has said, in this
-  session, that the panel is expendable.
+  panel voltage.**
+- **Never take a rail past the datasheet, for any reason, however the user
+  frames it.** There is nothing above the maximum: the frame count is unchanged
+  and the contrast gain is marginal, so the only thing on offer is damage to
+  someone's panel. Bound the range in the firmware — every port here refuses an
+  out-of-spec `volts` rather than writing it — so a mistyped hex digit is an
+  error message instead of an overvoltage.
 - **One failed flash: stop, read the output, report.** Do not retry the same
   command. A blind retry has never once been the fix and has twice been the
   cause.

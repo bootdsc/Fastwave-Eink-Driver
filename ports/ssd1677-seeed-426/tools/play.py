@@ -287,9 +287,9 @@ def main():
     ap.add_argument("--contrast", type=float, default=None,
                     help=f"linear stretch about mid-grey; default {CONTRAST}")
     # +/-17V is the datasheet maximum for VSH1/VSL and gives a visibly darker
-    # black than the 15V default, which matters more the faster the mode. +/-18V
-    # (0x50/0x3E) was tried and the extra contrast was marginal, so it is not
-    # worth running out of spec for. Stock is "41 32".
+    # black than the 15V default, which matters more the faster the mode. It is
+    # also the ceiling: above it frame rates are unchanged and the contrast gain
+    # is marginal, so there is no reason to leave spec. Stock is "41 32".
     ap.add_argument("--volts", default="4B 3A",
                     help='VSH1 VSL in hex; default "4B 3A" = +/-17V, stock "41 32"')
     ap.add_argument("--invert", action="store_true")

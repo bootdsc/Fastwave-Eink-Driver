@@ -73,7 +73,8 @@ The ESP32 divides 80 MHz by an integer, so the choices are 20, 26.7 and 40 —
 
 ```
 spi          40 MHz, once at boot
-volts        VSH1 0x4B  VSL 0x3A   (+/-17 V)
+volts        VSH1 0x4B  VSL 0x3A   (+/-17 V, the datasheet maximum and the
+             hard ceiling — `volts` rejects anything outside spec)
 fr           0x88
 invert LUT   true      (waveform polarity — NOT a host-side picture invert)
 activate     0x0C      (Mode 2 differential, rails already up)
@@ -131,13 +132,15 @@ than a mode of `stream`. The flash-free design is in
 
 Two adjacent gate lines on the panel this was measured on switch symmetrically
 slowly (~500 ms) and only reach 80–90% black. Reproduced on the vendor waveform,
-on both SPI transports, at maximum VGH: defective glass, not a software problem.
+on both SPI transports, at the maximum in-spec VGH: defective glass, not a
+software problem.
 Do not try to fix it in software, and do not treat those two lines as evidence
 about a waveform.
 
-That unit is also why `+/-18 V` — out of spec — was acceptable to try once. It
-gained identical frame rates and marginal contrast. Not worth it on a panel you
-care about.
+The reason it is written down: for most of a session those two lines looked
+like a waveform problem, and every waveform explanation for them was wrong. A
+fault that survives the vendor waveform, both SPI transports and every in-spec
+voltage is hardware.
 
 ## Also in here
 

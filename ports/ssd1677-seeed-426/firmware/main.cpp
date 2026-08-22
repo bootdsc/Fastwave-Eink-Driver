@@ -1756,6 +1756,22 @@ static void handle_cmd(char *s)
   if (!strncmp(s, "volts ", 6)) {
     unsigned a = 0, b2 = 0, c = 0, d = 0;
     int n = sscanf(s + 6, "%x %x %x %x", &a, &b2, &c, &d);
+    // Refuse out-of-spec source rails rather than writing them. This used to
+    // take any byte, which meant one mistyped hex digit drove all 480 gate
+    // lines past the datasheet — for no gain, because above the maximum the
+    // frame count is identical and the contrast difference is marginal.
+    if (n >= 1 && (a < 0x23 || a > 0x4B)) {
+      Serial.println("ERR vsh1 0x23..0x4B (9..17 V) - datasheet range");
+      return;
+    }
+    if (n >= 2 && (b2 < 0x1A || b2 > 0x3A)) {
+      Serial.println("ERR vsl 0x1A..0x3A (-9..-17 V) - datasheet range");
+      return;
+    }
+    if (n >= 4 && d > 0x17) {
+      Serial.println("ERR vgh <= 0x17 (20 V) - datasheet maximum");
+      return;
+    }
     if (n >= 1) g_wp.vsh1 = (uint8_t)a;
     if (n >= 2) g_wp.vsl = (uint8_t)b2;
     if (n >= 3) g_wp.vcom = (uint8_t)c;
