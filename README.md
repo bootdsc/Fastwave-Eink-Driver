@@ -154,7 +154,10 @@ within seven points of each other, convincingly, for months — are written down
 
 ## Provenance and licence
 
-Non-commercial use, share-alike: **CC BY-NC-SA 4.0**, see [LICENSE](LICENSE).
+Free for any use, including commercial, with attribution: **Apache License 2.0**,
+see [LICENSE](LICENSE) and [NOTICE](NOTICE). Ship it in a product, link it, fork
+it, sell the board it runs on. Keep the licence and the NOTICE with it, say what
+you changed, and the patent grant in section 3 covers you.
 
 The SSD1683 port's file naming and its bitmap font table descend from the board
 vendor's demo code for that panel; the driver bodies, the waveform builder and
@@ -177,3 +180,15 @@ than writing it.
   <br>
   <em>Grayscale test — four native SSD16xx levels, no dither.</em>
 </p>
+
+---
+
+## Use it
+
+Free for anything — commercial products, personal projects, whatever you are
+building. Ship it, link it, sell the board it runs on. All I ask is attribution,
+and that you **link back to this repository rather than forking it**: the numbers
+here get corrected when the glass says otherwise, and a fork freezes them at
+whatever was true the day it was cut.
+
+Made by Bootdsc for all you Chooms to use, copy and modify.

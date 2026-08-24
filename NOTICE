@@ -1,0 +1,9 @@
+fastwave
+Copyright 2026 Bootdsc
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+Source: https://github.com/bootdsc/fastwave
+
+Portions of the SSD1683 port descend from the board vendor's demo code for that
+panel; see the "Provenance and licence" section of README.md.
