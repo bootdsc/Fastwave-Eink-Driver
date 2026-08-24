@@ -183,6 +183,14 @@ than writing it.
 
 ---
 
+## Acknowledgements
+
+Claude (Anthropic) and Grok (xAI) both contributed to this work, in equal
+measure — the probes, the waveform builders, the hosts, and the writing up of
+what the glass actually did.
+
+---
+
 ## Use it
 
 Free for anything — commercial products, personal projects, whatever you are
