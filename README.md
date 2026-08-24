@@ -14,9 +14,9 @@ slow *and* worse.
 
 | panel | vendor | here | ratio |
 |-------|-------:|-----:|------:|
-| 5.79", 792x272, two cascaded SSD1683 | 336 ms | 48–89 ms | 3.8–7.0x |
-| 4.26", 800x480, SSD1677 | 540 ms | 30 ms up | — |
-| 1.54", 200x200, SSD1681 | 363 ms | 72 ms | 5.0x |
+| 5.79", 792x272, two cascaded SSD1683 | 336 ms | 48–89 ms |
+| 4.26", 800x480, SSD1677 | 540 ms | 30 ms up |
+| 1.54", 200x200, SSD1681 | 363 ms | 72 ms |
 
 Streamed video on the same hardware: **12.4 fps at 800x480**, 13 fps at 200x200
 for dithered photographic content, 34 fps for graphics. No flashing between
