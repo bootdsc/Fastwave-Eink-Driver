@@ -18,6 +18,13 @@ slow *and* worse.
 | 4.26", 800x480, SSD1677 | 540 ms | 30 ms up |
 | 1.54", 200x200, SSD1681 | 363 ms | 72 ms |
 
+The 5.79" figure is a range because it is drive-dependent: **89 ms** is the
+readable default (11 frames), and **48 ms** is drive 5 with `reset_tp 0`, which
+is 6 frames — faster, and lower contrast. Both ends are BUSY-pin measurements.
+The drive/busy tables are in
+[docs/INTEGRATION-ssd1683.md](docs/INTEGRATION-ssd1683.md#picking-the-speed-dial)
+and [docs/panels/SSD1683-crowpanel-5.79.md](docs/panels/SSD1683-crowpanel-5.79.md).
+
 Streamed video on the same hardware, with no flashing between frames: **12.4 fps
 at 800x480**, and on the 200x200 anything from 13 to 34 fps depending on how hard
 the drive is pushed. The rate there is a choice rather than a ceiling — pick the one

@@ -253,6 +253,13 @@ master leaves the two halves on different waveforms — that is what made earlie
 | 4 | 7 | 56 ms | 86 ms | 142 ms |
 | vendor `0xDC` | — | 336 ms | 43 ms | 379 ms |
 
+Those are `reset 2` numbers, so total frames = drive + 3. Drop `reset_tp` to 0
+and the same law gives drive 10 = 11 frames = 89 ms and drive 5 = 6 frames =
+48 ms — both measured, with HW SPI, in
+[../INTEGRATION-ssd1683.md](../INTEGRATION-ssd1683.md#picking-the-speed-dial).
+That pair is where the README's 48–89 ms range for this panel comes from; it is
+not in the table above because the table holds `reset 2` only.
+
 ---
 
 ## 7b. Trail chasing — clearing ghosts for free
