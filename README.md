@@ -18,9 +18,11 @@ slow *and* worse.
 | 4.26", 800x480, SSD1677 | 540 ms | 30 ms up |
 | 1.54", 200x200, SSD1681 | 363 ms | 72 ms |
 
-Streamed video on the same hardware: **12.4 fps at 800x480**, 13 fps at 200x200
-for dithered photographic content, 34 fps for graphics. No flashing between
-frames.
+Streamed video on the same hardware, with no flashing between frames: **12.4 fps
+at 800x480**, and on the 200x200 anything from 13 to 34 fps depending on how hard
+the drive is pushed. The rate there is a choice rather than a ceiling — pick the one
+nearest the source video's own frame rate, so frames are not being dropped
+unevenly.
 
 Every number in this repository came off a BUSY pin or out of a calibrated
 camera crop. Where something was inferred rather than measured, it says so.
@@ -77,8 +79,16 @@ Drive, trail, chase, framing and tone are knobs. The CLI is
 | panel | streamed |
 |-------|----------|
 | 4.26", 800×480 | **12.4 fps** |
-| 1.54", 200×200, dithered photo | 13 fps |
-| 1.54", 200×200, graphics | 34 fps |
+| 1.54", 200×200, drive 8 | 13 fps |
+| 1.54", 200×200, drive 4 | 22 fps |
+| 1.54", 200×200, drive 2 | 34 fps |
+
+On the 1.54" that whole range is usable — 20, 25 and 30 fps all look good. Drive
+count and `fr` set the rate, and they are chosen as a pair — see
+[docs/panels/SSD1681-1.54.md](docs/panels/SSD1681-1.54.md).
+Match it to the source video's frame rate rather than reaching for the highest
+number: a rate that does not divide into the source is what produces skipped and
+uneven-looking frames.
 
 ---
 
