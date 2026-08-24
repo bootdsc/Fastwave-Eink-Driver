@@ -12,8 +12,8 @@ one of them the fast waveform is also **higher contrast than the vendor's**,
 because the stock table is not a quality/speed tradeoff you are undoing. It is
 slow *and* worse.
 
-| panel | vendor | here | ratio |
-|-------|-------:|-----:|------:|
+| panel | vendor | here |
+|-------|-------:|-----:|
 | 5.79", 792x272, two cascaded SSD1683 | 336 ms | 48–89 ms |
 | 4.26", 800x480, SSD1677 | 540 ms | 30 ms up |
 | 1.54", 200x200, SSD1681 | 363 ms | 72 ms |
