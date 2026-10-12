@@ -209,13 +209,56 @@ def blit_fps_plate(gray, plate, portrait):
     return gray
 
 
-def panel_fps(drive, geo=None):
-    # drive+settle waveform + one-plane SPI (~18 ms at 40 MHz) + USB
+# Frame period in ms per FR code (SSD1683/SSD1681 Table 6-7). FR is a frame-rate
+# TARGET, not a consequence of gate count -- 0x3A/0x3B were swept across their
+# whole range on the 1.54" and moved the period by less than the probe's own
+# +/-1 us. So the code alone fixes the period, and this table is the whole law.
+#
+# 0x04 is measured (10.076 ms), not nominal; the rest are 1000/nominal Hz and
+# carry the same ~0.8% overhead in practice.
+FR_PERIOD_MS = {
+    0x01: 40.00, 0x02: 20.00, 0x03: 13.33, 0x04: 10.076, 0x05: 8.063,
+    0x09: 26.67, 0x0A: 16.00, 0x0B: 11.43, 0x0C: 8.889,
+}
+FR_DEFAULT = 0x04
+SPI_HZ_DEFAULT = 40_000_000
+
+# Everything that is neither waveform nor wire: the host's per-frame work and
+# the USB round trip. The old hardcoded 4.0 ms "SPI" term quietly carried this,
+# which is why splitting the wire out on its own made the estimate optimistic
+# rather than accurate.
+#
+# FITTED, then checked out of sample. Drive 1 measures 45.9-46.1 fps = 21.74 ms
+# against 2 x 10.076 ms of waveform and 1.0 ms of wire, leaving 0.6 ms.
+#
+# Fitting one constant to one point proves nothing on its own -- the match is
+# what fitting means. The check is a drive count that was NOT fitted: drive 3
+# predicts 23.9 fps and measures 23.9. That doubles the waveform term while
+# wire and overhead stay fixed, so a 0.6 that was really absorbing per-frame
+# cost would have drifted there. It did not, which is what makes the split
+# between per-frame and fixed cost trustworthy rather than convenient.
+#
+# Still only two points on one panel. It is a good constant, not a law.
+HOST_OVERHEAD_MS = 0.6
+
+
+def panel_fps(drive, geo=None, fr=None, spi_hz=None):
+    """Predicted panel fps for a custom-waveform drive.
+
+    Both the frame period and the wire time used to be hardcoded here -- 8.063
+    ms (FR 0x05) and 4 ms (one plane at 20 MHz). The port runs FR 0x04 at 40
+    MHz, so the readout sat ~4 fps optimistic against the panel beside it. Both
+    are derived now, so this stays honest when either is changed.
+
+    Only valid with `fast on`. The OTP partial is a flat 363 ms regardless.
+    """
     if geo is not None and geo.name == "xiao-154":
-        # Measured law, custom waveform: busy = frames x 8.063 ms at FR 0x05,
-        # frames = drive + settle(1), plus ~4 ms for one 5000-byte plane at
-        # 20 MHz. Only valid with `fast on`; the OTP partial is a flat 363 ms.
-        return 1000.0 / ((drive + 1) * 8.063 + 4.0)
+        period = FR_PERIOD_MS.get(fr if fr else FR_DEFAULT,
+                                  FR_PERIOD_MS[FR_DEFAULT])
+        # One 5000-byte plane. 5000 x 8 bits / Hz, in milliseconds.
+        hz = spi_hz if spi_hz else SPI_HZ_DEFAULT
+        wire = 40_000_000.0 / float(hz)
+        return 1000.0 / ((drive + 1) * period + wire + HOST_OVERHEAD_MS)
     return 1000.0 / ((drive + 1) * 9.92 + 20.0)
 
 
@@ -452,6 +495,26 @@ def pack_wire_banner(raw):
 
 PANEL_RE = re.compile(rb"panel=([A-Za-z0-9_\-]+)")
 PANEL_KEYS = ("xiao-426", "xiao-154", "crow-579")
+FR_RE = re.compile(rb"\bfr=0x([0-9A-Fa-f]{2})")
+SPIHZ_RE = re.compile(rb"\bspi=\S+\s+\S+\s+(\d+)Hz")
+
+
+def timing_from_text(raw):
+    """Pull the FR code and SPI clock out of a STATUS blob.
+
+    Returns (fr, spi_hz), either of which may be None. The device is the only
+    authority on both: the host's defaults are a guess that goes stale the
+    moment a boot constant or a live `fr` changes, and a wrong one here shows
+    up as an fps readout that disagrees with the panel next to it.
+    """
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    raw = raw or b""
+    m = FR_RE.search(raw)
+    fr = int(m.group(1), 16) if m else None
+    m = SPIHZ_RE.search(raw)
+    hz = int(m.group(1)) if m else None
+    return fr, hz
 
 
 def panel_from_text(raw):
@@ -476,6 +539,8 @@ def confirm_panel(s, knobs, forced):
     Returns True to proceed. A forced panel that contradicts the device is a
     hard stop: the plane sizes differ by 10x and the result is pure noise.
     """
+    knobs.fr = getattr(s, "ink_fr", None)
+    knobs.spi_hz = getattr(s, "ink_spi_hz", None)
     rep = getattr(s, "ink_panel", None)
     if not rep:
         print("device reported no panel= — packing as %s" % knobs.panel)
@@ -842,6 +907,10 @@ class Knobs:
         self.bias = args.bias
         self.trail = 0
         self.chase = 0
+        # Filled in from STATUS by confirm_panel(). None means "not asked yet",
+        # and panel_fps() falls back to the port's boot defaults.
+        self.fr = None
+        self.spi_hz = None
         self.invert = args.invert
         self.mirror = not bool(args.no_mirror)
         self.fit = args.fit
@@ -865,7 +934,8 @@ class Knobs:
 
     def line(self):
         geo = getattr(self, "geo", None)
-        return (f"drive {self.drive} (~{panel_fps(self.drive, geo):.1f} fps)  "
+        return (f"drive {self.drive} "
+                f"(~{panel_fps(self.drive, geo, self.fr, self.spi_hz):.1f} fps)  "
                 f"trail {self.trail}/{self.chase}  "
                 f"dith {int(self.dither)}  "
                 f"{VOLT_N[self.volt_i]}  g={self.gamma:.2f} "
@@ -1006,7 +1076,9 @@ class Cam(threading.Thread):
             n = max(0, self.nframes)
             rate = self.src_fps
             geo = getattr(self.knobs, "geo", None)
-            pf = panel_fps(int(getattr(self.knobs, "drive", DRIVE)), geo)
+            pf = panel_fps(int(getattr(self.knobs, "drive", DRIVE)), geo,
+                           getattr(self.knobs, "fr", None),
+                           getattr(self.knobs, "spi_hz", None))
             show_fps = min(rate, max(pf * 1.2, 12.0))
             while self.running:
                 if self.knobs.paused:
@@ -1157,6 +1229,7 @@ def open_serial(port):
                 if panel_from_text(raw):
                     break
             s.ink_panel = panel_from_text(raw)
+            s.ink_fr, s.ink_spi_hz = timing_from_text(raw)
             s.ink_status = raw.decode("utf-8", "replace").strip()
             s.reset_input_buffer()
             return s

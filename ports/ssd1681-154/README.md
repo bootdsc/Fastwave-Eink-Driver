@@ -127,12 +127,18 @@ Not waveform time. Against the 5.79" at 5.4x the pixel count:
 | | 5.79" | 1.54" |
 |--|--:|--:|
 | frame period at FR `0x05` | 8.11 ms | 8.06 ms — **no gain** |
-| SPI, both planes | 13 ms @ 40 MHz | 4 ms @ 20 MHz |
-| 5-frame wall clock | 62 ms → 16 fps | 52 ms → 19 fps |
+| SPI, both planes | 13 ms @ 40 MHz | 2 ms @ 40 MHz |
+| 5-frame wall clock | 62 ms → 16 fps | 50 ms → 20 fps |
 
 Expect ~1.2x, not 5x. The frame period is a frame-rate target, not a function of
 gate count, and BUSY has no content dependence. Fewer pixels buys transfer time
 and trail-chase headroom, and nothing else.
+
+That target looks like a hard floor. `ltsweep` walks `0x3A` dummy line period
+and `0x3B` gate line width against the measured frame period, under two activate
+bytes so an OTP reload cannot hide a result, and on this panel neither register
+moved it by more than the probe's own +/-1 us. `fr` appears to be the only
+control over the period here. See `docs/panels/SSD1681-1.54.md`.
 
 ## Read next
 

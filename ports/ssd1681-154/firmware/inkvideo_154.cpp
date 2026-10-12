@@ -197,6 +197,18 @@ static uint32_t wave_predict_us(void) {
   return (uint32_t)wave_frames() * PER[fr];
 }
 
+// Wire time for both planes, from the clock actually in force.
+//
+// Was hardcoded at 4000 us, which was right only while the port ran at 20 MHz.
+// It now runs at 40, so the constant read 2 ms high and every fps figure off
+// `status` was pessimistic by that much. Derived, not re-hardcoded, so it stays
+// honest if the clock moves again: 2 planes x 5000 bytes x 8 bits = 80000 bit
+// times, and 80000 bits / Hz in microseconds is 80e9 / Hz.
+static uint32_t plane_pair_spi_us(void) {
+  const uint32_t hz = EPD_GetHwSpiHz();
+  return hz ? (uint32_t)(80000000000ULL / (uint64_t)hz) : 0;
+}
+
 static void wave_show(void) {
   const uint32_t us = wave_predict_us();
   Serial.printf("FAST %s fr=0x%02X reset=%u drive=%u settle=%u bb=%u ww=%u "
@@ -213,10 +225,13 @@ static void wave_show(void) {
   Serial.printf("     vsh1=0x%02X vsh2=0x%02X vsl=0x%02X vcom=0x%02X eopt=0x%02X\n",
                 (unsigned)g_wp.vsh1, (unsigned)g_wp.vsh2, (unsigned)g_wp.vsl,
                 (unsigned)g_wp.vcom, (unsigned)g_eopt);
-  Serial.printf("     frames=%u predict=%lu us (%lu.%lu fps at +4ms SPI)\n",
+  const uint32_t spi_us = plane_pair_spi_us();
+  Serial.printf("     frames=%u predict=%lu us (%lu.%lu fps at +%lu.%lums SPI)\n",
                 (unsigned)wave_frames(), (unsigned long)us,
-                (unsigned long)(1000000UL / (us + 4000UL)),
-                (unsigned long)((10000000UL / (us + 4000UL)) % 10));
+                (unsigned long)(1000000UL / (us + spi_us)),
+                (unsigned long)((10000000UL / (us + spi_us)) % 10),
+                (unsigned long)(spi_us / 1000UL),
+                (unsigned long)((spi_us / 100UL) % 10));
 }
 
 static void drive_solid(uint8_t val) {
@@ -448,6 +463,130 @@ static void wave_calib(uint8_t fr, uint8_t act) {
   calib_one(fr, WAVE1681_ORDER_RP_FIRST, act);
   Serial.println("CALIB done. Resident LUT is the null probe: it drives nothing.");
   Serial.println("  `white`, or any seq with b4 (0x1C/0xFC), reloads OTP.");
+  g_white_known = false;
+}
+
+// ---------------------------------------------------------------------------
+// Line timing: 0x3A dummy line period, 0x3B gate line width
+// ---------------------------------------------------------------------------
+//
+// The last untried lever on this panel. FR is a frame-rate TARGET, not a
+// consequence -- which is why 200 gate lines cost the same 8.06 ms per frame as
+// the 5.79"'s 272. The part is padding to hit the target. 0x3A and 0x3B set the
+// line timing directly, and until now no firmware in this repo wrote either;
+// EPD_Init leaves both at POR.
+//
+// If the gate line can be shortened, the frame period drops BELOW the FR floor,
+// and since every waveform costs frames x period, that multiplies across the
+// whole drive. It is the only route to beating the 5.79" by more than the
+// transfer margin -- which is 2 ms and now measured, so this is the whole
+// remaining budget.
+//
+// 0 means "never written, still at POR". EPD_WriteLineTiming skips zero values
+// rather than writing them, so 0 cannot be sent by accident. Both registers are
+// volatile: any 0x22 carrying a load-LUT bit, or a reset, restores POR. Nothing
+// here can be made permanent, which is why this is safe to sweep.
+static uint8_t g_dummy_line = 0;
+static uint8_t g_gate_width = 0;
+
+static void linetime_show(void) {
+  Serial.printf("LINETIME 0x3A dummy=%s 0x3B gate=%s\n",
+                g_dummy_line ? "set" : "POR", g_gate_width ? "set" : "POR");
+  if (g_dummy_line || g_gate_width)
+    Serial.printf("     dummy=0x%02X gate=0x%02X\n", (unsigned)g_dummy_line,
+                  (unsigned)g_gate_width);
+}
+
+// Frame period in microseconds, from two null-LUT points.
+//
+// calib_one already proved the relation is linear across four points, so the
+// two ends of that line are enough and a sweep wants to be quick. Returns 0 if
+// BUSY ever hangs -- which is exactly how a line-timing value the part dislikes
+// announces itself, so 0 means "bad setting", not "no data".
+static int32_t frame_period_us(uint8_t fr, uint8_t act) {
+  static const uint8_t TPS[2] = {4, 32};
+  uint32_t us[2];
+  if (act & 0x10) return 0;  // b4 would reload the OTP LUT and time it instead
+  for (uint8_t i = 0; i < 2; i++) {
+    wave1681_build_null(g_lut, TPS[i], fr, WAVE1681_ORDER_RP_FIRST);
+    EPD_WriteLut(g_lut);
+    uint32_t busy = 0;
+    (void)EPD_Update(act, &busy);
+    if (EPD_BusyTimedOut()) return 0;
+    us[i] = busy;
+  }
+  return (int32_t)((us[1] - us[0]) / (uint32_t)(TPS[1] - TPS[0]));
+}
+
+// The sweep runs under TWO activate bytes and prints both.
+//
+//   0x0C  SEQ_RESIDENT — b3 "load LUT mode 2" + b2 display. b3 is nominally a
+//         load-LUT bit, so on its own it cannot rule out the part restoring
+//         line timing from OTP between the write and the measurement.
+//   0x84  b7 clock on + b2 display. NO load-LUT bit of any kind. Rails come up
+//         separately: EPD_UpdateKick brings them when b6 is clear.
+//
+// If 0x3A/0x3B do anything, the 0x84 column is where it survives. Agreement
+// between the columns is the result; disagreement means b3 was wiping the
+// registers and the flat reading was an artefact.
+#define SEQ_PROBE_NOLUT 0x84
+
+// Sweep one register against the frame period, holding the other at POR.
+//
+// Baseline first, so a part that ignores the register entirely reads as a flat
+// column rather than as a win. A value that hangs BUSY prints and the sweep
+// stops there: past that point the part is not timing what we think it is.
+static void wave_ltsweep(uint8_t which, uint8_t fr) {
+  EPD_WriteEopt(g_eopt);
+  if (!EPD_AnalogIsOn()) EPD_AnalogPower(true);
+
+  EPD_Init();
+  g_dummy_line = g_gate_width = 0;
+  const int32_t base_a = frame_period_us(fr, SEQ_RESIDENT);
+  EPD_Init();
+  const int32_t base_b = frame_period_us(fr, SEQ_PROBE_NOLUT);
+  Serial.printf("LTSWEEP 0x%02X fr=0x%02X  POR period 0x0C=%ld us  0x84=%ld us\n",
+                (unsigned)which, (unsigned)fr, (long)base_a, (long)base_b);
+  if (base_a <= 0 || base_b <= 0) {
+    Serial.printf("  abort: baseline did not measure (0x0C=%ld 0x84=%ld)\n",
+                  (long)base_a, (long)base_b);
+    return;
+  }
+
+  static const uint8_t VALS[] = {0x01, 0x02, 0x04, 0x08, 0x0C, 0x10,
+                                 0x18, 0x20, 0x30, 0x40, 0x80};
+  for (uint8_t i = 0; i < sizeof(VALS); i++) {
+    // Re-init between points. These registers are volatile and the null probe
+    // itself kicks 0x22, so without this each row would inherit the last.
+    EPD_Init();
+    if (which == 0x3A) EPD_WriteLineTiming(VALS[i], 0);
+    else EPD_WriteLineTiming(0, VALS[i]);
+    const int32_t pa = frame_period_us(fr, SEQ_RESIDENT);
+
+    // Re-write the register before the second probe. The first probe's own
+    // activate byte is exactly what is under suspicion, so the 0x84 column
+    // must not inherit whatever 0x0C may have done to it.
+    EPD_Init();
+    if (which == 0x3A) EPD_WriteLineTiming(VALS[i], 0);
+    else EPD_WriteLineTiming(0, VALS[i]);
+    const int32_t pb = frame_period_us(fr, SEQ_PROBE_NOLUT);
+
+    if (pa <= 0 || pb <= 0) {
+      Serial.printf("  0x%02X=0x%02X  BUSY hung (0x0C=%ld 0x84=%ld) -- stopping\n",
+                    (unsigned)which, (unsigned)VALS[i], (long)pa, (long)pb);
+      break;
+    }
+    const long da = (long)pa - (long)base_a;
+    const long db = (long)pb - (long)base_b;
+    const long worst = (da < db) ? da : db;
+    Serial.printf("  0x%02X=0x%02X  0x0C=%6ld %+5ld  0x84=%6ld %+5ld  %s\n",
+                  (unsigned)which, (unsigned)VALS[i], (long)pa, da, (long)pb, db,
+                  worst < -200 ? "FASTER" : (worst > 200 ? "slower" : "no effect"));
+  }
+  EPD_Init();
+  g_dummy_line = g_gate_width = 0;
+  Serial.println("LTSWEEP done, both registers back at POR.");
+  Serial.println("  Resident LUT is the null probe. `white` reloads OTP.");
   g_white_known = false;
 }
 
@@ -717,6 +856,10 @@ static void print_help(void) {
   Serial.println("  seq X       0x1C load LUT2 (363ms), 0xFC self-powered");
   Serial.println("  calib [fr]  null-LUT timing probe, marks nothing (fr 1..5)");
   Serial.println("  seqscan     same probe, sweeps the 0x22 activate byte");
+  Serial.println("  ltsweep [3a|3b]  line timing vs frame period. 3b = gate");
+  Serial.println("              width, the only lever left on the 60ms floor");
+  Serial.println("  linetime A B     0x3A dummy, 0x3B gate. 0 = leave at POR");
+  Serial.println("  linetime por     re-init, both back to POR");
   Serial.println("  bytescan    same probe, perturbs each group-0 timing byte");
   Serial.println("  eopt X      0x3F display-off. 0x22 POR = 2 discharge scans,");
   Serial.println("              0x07 = keep pixel voltage");
@@ -756,7 +899,8 @@ static void print_status(void) {
                 (unsigned)g_trail, (unsigned)g_trail_every, EPD_SpiPathName(),
                 (unsigned long)EPD_GetHwSpiHz(), (unsigned)EPD_AnalogIsOn(),
                 (unsigned)g_white_known);
-  Serial.printf("       eopt=0x%02X\n", (unsigned)g_eopt);
+  Serial.printf("       eopt=0x%02X linetime=%s/%s\n", (unsigned)g_eopt,
+                g_dummy_line ? "set" : "POR", g_gate_width ? "set" : "POR");
   if (g_wave_on) wave_show();
 }
 
@@ -860,6 +1004,44 @@ static void handle_cmd(char *s) {
       wave_calib((uint8_t)v, SEQ_RESIDENT);
     else
       Serial.println("ERR calib needs an FR code 1..15 (1=25Hz .. 5=125Hz)");
+    return;
+  }
+  if (!strcmp(s, "ltsweep") || !strcmp(s, "ltsweep 3b")) {
+    wave_ltsweep(0x3B, g_wp.fr);
+    return;
+  }
+  if (!strcmp(s, "ltsweep 3a")) {
+    wave_ltsweep(0x3A, g_wp.fr);
+    return;
+  }
+  if (!strcmp(s, "linetime")) {
+    linetime_show();
+    return;
+  }
+  if (!strcmp(s, "linetime por")) {
+    // POR is not a value we can write back -- these registers are not readable
+    // and the datasheet POR is not stated for both. A re-init is what restores
+    // them, so that is what "por" means here.
+    EPD_Init();
+    g_dummy_line = g_gate_width = 0;
+    g_white_known = false;
+    if (g_wave_on) arm_wave();
+    linetime_show();
+    Serial.println("  re-inited. OTP LUT is resident again; `fast on` re-arms.");
+    return;
+  }
+  if (!strncmp(s, "linetime ", 9)) {
+    long a, b;
+    if (parse_hex2(s + 9, &a, &b) && a >= 0 && a <= 0xFF && b >= 0 && b <= 0xFF) {
+      g_dummy_line = (uint8_t)a;
+      g_gate_width = (uint8_t)b;
+      EPD_WriteLineTiming(g_dummy_line, g_gate_width);
+      linetime_show();
+      Serial.println("  volatile: any load-LUT 0x22 or a reset restores POR.");
+    } else {
+      Serial.println("  linetime A B  two hex bytes, 0x3A dummy then 0x3B gate");
+      Serial.println("  a 0 leaves that register alone; `linetime por` re-inits");
+    }
     return;
   }
   if (!strncmp(s, "eopt ", 5)) {
@@ -1067,7 +1249,23 @@ void setup(void) {
   }
 
   wave1681_defaults(&g_wp);
-  EPD_SetHwSpiHz(20000000);
+  // 40 MHz = 80/2, DOUBLE the SSD1681's specified 20. Untried on this panel
+  // until now; it runs clean at 2x spec on the SSD1677, which is the same
+  // Solomon SPI front end, so the expectation is that it holds here too.
+  //
+  // The prize is small and known in advance: both planes are 10000 bytes, so
+  // SPI is 4 ms of a 52 ms frame. Halving it buys ~2 ms — 19 to ~19.8 fps, 4%.
+  // The frame period is the real cost and 0x3A/0x3B are the lever for it.
+  // This is here so the wire is not the excuse when that sweep runs.
+  //
+  // Set it HERE, at boot, and never at runtime. Rebuilding the SPI device
+  // mid-traffic wedges the controller: transfers still complete but it stops
+  // acting on commands, busy=0 the only symptom, and only a board reset clears
+  // it. Measured on the 4.26" at both 26.7 and 40 MHz. It is a property of the
+  // switch, not of the clock — one speed for the controller's whole life is
+  // stable. Verify against `card` before trusting a frame: a marginal clock
+  // corrupts the plane write, which reads as speckle, not as a hang.
+  EPD_SetHwSpiHz(40000000);
   EPD_SetSpiPath(EPD_SPI_HW);
   EPD_GPIOInit();
   EPD_Init();

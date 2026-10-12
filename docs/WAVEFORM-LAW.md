@@ -187,6 +187,11 @@ and 72.6 ms for equal contrast. Faster *and* darker. This is the one knob in
 the repo whose two axes are not independent, and the reason it ships at `0x04`
 rather than the fastest available code.
 
+That port now ships `0x04` at **drive 3** — 4 frames, 40.3 ms — with the black
+top-up at 20 carrying the contrast instead of extra drive frames. Contrast was
+flat from drive 3 to 6 on that glass, so the frames above 3 were being spent on
+a shelf. See [panels/SSD1681-1.54.md](panels/SSD1681-1.54.md).
+
 ---
 
 ## 6. The costs that are not frames
