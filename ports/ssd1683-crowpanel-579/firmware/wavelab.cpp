@@ -16,8 +16,8 @@
 // exactly what the "BUSY is content-independent, min == med == max" result said.
 // So the only lever is the LUT itself, and `calib` measures the law directly.
 //
-// Two circles animate together so fill and thin-line rendering can be compared
-// under the same waveform — thin outlines are where fast waveforms fail first.
+// Boots to a short splash (see BOOT SPLASH below), then a white panel, idle.
+// `run` animates one moving disc for judging a waveform by eye.
 //
 // Controls (buttons around the jog wheel):
 //   RIGHT (GPIO2) = run        LEFT (GPIO1) = stop
@@ -37,6 +37,26 @@
 #include "spi.h"
 #include "waveform.h"
 
+// ============================================================================
+// BOOT SPLASH: edit these to put your own message on the panel at power-on.
+//
+// The panel shows BOOT_SPLASH_TEXT, centred, for BOOT_SPLASH_MS, then clears
+// to white and waits for the host. Set BOOT_SPLASH_TEXT to "" to skip it.
+//
+//   BOOT_SPLASH_TEXT   what to show; one line, plain ASCII
+//   BOOT_SPLASH_MS     how long it stays up, in milliseconds
+//   BOOT_SPLASH_SIZE   font height: 12, 16, 24 or 48 (the sizes EPDfont.h has).
+//                      A line too wide for the panel drops to the next size.
+//   BOOT_SPLASH_ROT    which way up: 270 is the panel's normal orientation, the
+//                      one Ink Flow's Rotation 0 matches. 0 / 90 / 180 turn it.
+//
+// Showing and clearing it are one ordinary update each, no full-screen flash.
+// ============================================================================
+#define BOOT_SPLASH_TEXT "Fastwave"
+#define BOOT_SPLASH_MS 1500
+#define BOOT_SPLASH_SIZE 48
+#define BOOT_SPLASH_ROT 270
+
 // ---- board ------------------------------------------------------------------
 #define PIN_PWR 7
 #define BTN_BACK 1  // left
@@ -50,7 +70,7 @@
 #define PH 792
 
 // ---- animation geometry -----------------------------------------------------
-// Ms Pac-Man box size in pixels; the sprite is drawn to fill it. `box N` changes
+// Bench disc box size in pixels; the disc is drawn to fill it. `box N` changes
 // it live so the render cost can be measured against fps at several sizes.
 #define CIRCLE_R_DEFAULT 16  // 16 -> a 32x32 box
 // One solid disc. The outline circle was there to show thin-line rendering, but
@@ -423,9 +443,9 @@ static void btn_task(void *) {
 }
 
 // ---- paint ------------------------------------------------------------------
-// Point the Paint layer at a buffer WITHOUT clearing it. Needed because the maze
-// template is rasterised into its own buffer and then blitted, so the target has to
-// be switched back and forth without destroying either side.
+// Point the Paint layer at a buffer WITHOUT clearing it. Needed because the stream
+// HUD is rasterised into its own buffer and then pasted, so the target has to be
+// switched back and forth without destroying either side.
 static void paint_bind(uint8_t *buf) {
   Paint_NewImage(buf, EPD_W, EPD_H, Rotation, WHITE);
 }
@@ -613,8 +633,9 @@ static void fill_rect(int x0, int y0, int x1, int y1, uint16_t colour) {
     for (int x = x0; x <= x1; x++) Paint_SetPixel((uint16_t)x, (uint16_t)y, colour);
 }
 
-// Text on a white pad. The maze runs under the HUD, and black glyphs on black wall
-// are unreadable — so knock a white hole the size of the text plus PAD out first.
+// Text on a white pad. The bench disc runs under the HUD, and black glyphs on a
+// black disc are unreadable — so knock a white hole the size of the text plus PAD
+// out first.
 // Glyph advance is size/2 in this font, so the extent is known without measuring.
 #define HUD_PAD 4
 static void hud_text(int x, int y, const char *str, int size) {
@@ -694,326 +715,16 @@ static uint8_t g_label_settle = LABEL_SETTLE_FRAMES;
 // transfer to reach steady state, then take a few samples and freeze for good.
 static uint16_t g_settle_delay = 0;
 
-// ---- Ms Pac-Man level -------------------------------------------------------
-// 11 x 33 cells of 24 px fills 264 x 792 of the 272 x 792 canvas, 4 px of margin
-// each side. The grid is odd in both axes so the classic carve-on-odd-cells maze
-// algorithm applies directly.
-#define MZ_CELL 24
-#define MZ_COLS 11
-#define MZ_ROWS 33
-#define MZ_OX ((PW - MZ_COLS * MZ_CELL) / 2)
-#define MZ_OY 0
-#define MZ_STEP 4        // px per frame; 24/4 = 6 frames per cell, so centres land exactly
-#define MZ_GHOSTS 4
-
-static uint8_t mz_wall[MZ_ROWS][MZ_COLS];
-static uint8_t mz_dot[MZ_ROWS][MZ_COLS];
-static uint16_t mz_dots_left = 0;
-static uint32_t mz_score = 0;
-
-typedef struct {
-  int px, py;      // pixel centre
-  int8_t dx, dy;   // unit direction
-  uint8_t shade;   // Bayer threshold: stands in for ghost colour
-} MzEnt;
-
-// Static-maze template.
+// ---- bench frame ------------------------------------------------------------
+// White field, the MODE / timing readout, and (while `run` is on) one moving
+// disc. Nothing else.
 //
-// mz_draw_board() rasterised all 363 cells through Paint_SetPixel EVERY frame —
-// ~190k pixel writes, measured at 38 ms, which was more than the entire per-frame
-// cost we spent the session removing. The maze is static and the pellets change one
-// cell at a time, so it is rasterised ONCE per level into this buffer and each frame
-// starts as a memcpy of it (~27 KB, under 1 ms). Eating a pellet punches that one
-// pellet out of the template rather than triggering a rebuild.
-static uint8_t mz_bg[(uint32_t)EPD_H * FB_WBYTES];
-static void mz_bg_rebuild(void);
-static void mz_bg_clear_dot(int r, int c);
-
-static MzEnt mz_pac;
-static MzEnt mz_gh[MZ_GHOSTS];
-
-static inline int mz_cx(int c) { return MZ_OX + c * MZ_CELL + MZ_CELL / 2; }
-static inline int mz_cy(int r) { return MZ_OY + r * MZ_CELL + MZ_CELL / 2; }
-static inline bool mz_open(int r, int c) {
-  return r >= 0 && r < MZ_ROWS && c >= 0 && c < MZ_COLS && !mz_wall[r][c];
-}
-// True when an entity sits exactly on a cell centre, which is the only moment a
-// direction change is legal — otherwise sprites drift off the lattice and clip walls.
-static inline bool mz_centred(const MzEnt *e) {
-  return ((e->px - MZ_OX - MZ_CELL / 2) % MZ_CELL) == 0 &&
-         ((e->py - MZ_OY - MZ_CELL / 2) % MZ_CELL) == 0;
-}
-static inline int mz_col(const MzEnt *e) { return (e->px - MZ_OX) / MZ_CELL; }
-static inline int mz_row(const MzEnt *e) { return (e->py - MZ_OY) / MZ_CELL; }
-
-// Carve a perfect maze on the odd cells with an explicit stack (no recursion — this
-// runs on the Arduino loop task), then MIRROR the left half onto the right so it
-// reads as a Pac-Man board rather than a generic labyrinth, then punch a few extra
-// holes so there are loops to chase around. A perfect maze has exactly one route
-// between any two points, which makes for terrible pursuit.
-static void mz_build(void) {
-  memset(mz_wall, 1, sizeof(mz_wall));
-
-  const int half = MZ_COLS / 2 + 1;  // carve cols 1..5, mirror 1..4 onto 9..6
-  int8_t st_r[MZ_ROWS * MZ_COLS], st_c[MZ_ROWS * MZ_COLS];
-  int sp = 0;
-  st_r[0] = 1;
-  st_c[0] = 1;
-  sp = 1;
-  mz_wall[1][1] = 0;
-
-  while (sp) {
-    int r = st_r[sp - 1], c = st_c[sp - 1];
-    int dirs[4] = {0, 1, 2, 3};
-    for (int i = 3; i > 0; i--) {  // shuffle
-      int j = (int)(esp_random() % (uint32_t)(i + 1));
-      int t = dirs[i];
-      dirs[i] = dirs[j];
-      dirs[j] = t;
-    }
-    bool moved = false;
-    for (int i = 0; i < 4 && !moved; i++) {
-      int nr = r, nc = c;
-      if (dirs[i] == 0) nr -= 2;
-      else if (dirs[i] == 1) nr += 2;
-      else if (dirs[i] == 2) nc -= 2;
-      else nc += 2;
-      if (nr < 1 || nr >= MZ_ROWS - 1 || nc < 1 || nc >= half) continue;
-      if (!mz_wall[nr][nc]) continue;
-      mz_wall[(r + nr) / 2][(c + nc) / 2] = 0;
-      mz_wall[nr][nc] = 0;
-      st_r[sp] = (int8_t)nr;
-      st_c[sp] = (int8_t)nc;
-      sp++;
-      moved = true;
-    }
-    if (!moved) sp--;
-  }
-
-  // Extra openings on the carved half, for loops.
-  for (int k = 0; k < MZ_ROWS; k++) {
-    int r = 1 + (int)(esp_random() % (uint32_t)(MZ_ROWS - 2));
-    int c = 1 + (int)(esp_random() % (uint32_t)(half - 1));
-    if (r % 2 == 1 || c % 2 == 1) mz_wall[r][c] = 0;
-  }
-
-  for (int r = 0; r < MZ_ROWS; r++)
-    for (int c = 0; c < MZ_COLS / 2; c++) mz_wall[r][MZ_COLS - 1 - c] = mz_wall[r][c];
-
-  // Outer ring stays solid.
-  for (int c = 0; c < MZ_COLS; c++) { mz_wall[0][c] = 1; mz_wall[MZ_ROWS - 1][c] = 1; }
-  for (int r = 0; r < MZ_ROWS; r++) { mz_wall[r][0] = 1; mz_wall[r][MZ_COLS - 1] = 1; }
-
-  mz_dots_left = 0;
-  for (int r = 0; r < MZ_ROWS; r++)
-    for (int c = 0; c < MZ_COLS; c++) {
-      mz_dot[r][c] = mz_wall[r][c] ? 0 : 1;
-      if (mz_dot[r][c]) mz_dots_left++;
-    }
-}
-
-// First step of a shortest path from (r0,c0) to the nearest cell where want() holds.
-// Plain BFS over 363 cells — trivial next to 5 ms of SPI, and it means Pac-Man
-// actually hunts pellets instead of wandering into corners.
-static bool mz_bfs_step(int r0, int c0, bool dots, int8_t *odx, int8_t *ody) {
-  static int16_t prev[MZ_ROWS * MZ_COLS];
-  static int16_t q[MZ_ROWS * MZ_COLS];
-  for (int i = 0; i < MZ_ROWS * MZ_COLS; i++) prev[i] = -1;
-  int head = 0, tail = 0;
-  int start = r0 * MZ_COLS + c0;
-  q[tail++] = (int16_t)start;
-  prev[start] = (int16_t)start;
-  int found = -1;
-
-  while (head < tail && found < 0) {
-    int cur = q[head++];
-    int r = cur / MZ_COLS, c = cur % MZ_COLS;
-    static const int8_t dr[4] = {-1, 1, 0, 0}, dc[4] = {0, 0, -1, 1};
-    for (int i = 0; i < 4; i++) {
-      int nr = r + dr[i], nc = c + dc[i];
-      if (!mz_open(nr, nc)) continue;
-      int nid = nr * MZ_COLS + nc;
-      if (prev[nid] >= 0) continue;
-      prev[nid] = (int16_t)cur;
-      if (dots && mz_dot[nr][nc]) { found = nid; break; }
-      q[tail++] = (int16_t)nid;
-    }
-  }
-  if (found < 0) return false;
-
-  int cur = found;
-  while (prev[cur] != start && prev[cur] != cur) cur = prev[cur];
-  *odx = (int8_t)((cur % MZ_COLS) - c0);
-  *ody = (int8_t)((cur / MZ_COLS) - r0);
-  return true;
-}
-
-static void mz_reset(void) {
-  mz_build();
-  mz_bg_rebuild();
-  mz_score = 0;
-
-  // Pac-Man in the lowest open cell, ghosts spread down the board.
-  int pr = MZ_ROWS - 2, pc = MZ_COLS / 2;
-  while (pr > 1 && !mz_open(pr, pc)) pr--;
-  mz_pac.px = mz_cx(pc);
-  mz_pac.py = mz_cy(pr);
-  mz_pac.dx = 0;
-  mz_pac.dy = -1;
-
-  // Four dither levels stand in for the four ghost colours: 16 = solid, 4 = light.
-  static const uint8_t kShades[MZ_GHOSTS] = {16, 11, 7, 4};
-  for (int i = 0; i < MZ_GHOSTS; i++) {
-    int gr = 2 + (i * (MZ_ROWS - 6)) / MZ_GHOSTS, gc = MZ_COLS / 2;
-    while (gr < MZ_ROWS - 2 && !mz_open(gr, gc)) gr++;
-    mz_gh[i].px = mz_cx(gc);
-    mz_gh[i].py = mz_cy(gr);
-    mz_gh[i].dx = 0;
-    mz_gh[i].dy = 1;
-    mz_gh[i].shade = kShades[i];
-  }
-}
-
-static void mz_step_ent(MzEnt *e) {
-  e->px += e->dx * MZ_STEP;
-  e->py += e->dy * MZ_STEP;
-}
-
-static void mz_advance(void) {
-  // --- Pac-Man
-  if (mz_centred(&mz_pac)) {
-    int r = mz_row(&mz_pac), c = mz_col(&mz_pac);
-    if (mz_dot[r][c]) {
-      mz_dot[r][c] = 0;
-      mz_bg_clear_dot(r, c);  // one 7x7 patch, not a full re-rasterise
-      if (mz_dots_left) mz_dots_left--;
-      mz_score += 10;
-    }
-    if (!mz_dots_left) mz_reset();  // board cleared: new maze, keeps the demo going
-    else {
-      int8_t nx = 0, ny = 0;
-      if (mz_bfs_step(r, c, true, &nx, &ny)) {
-        mz_pac.dx = nx;
-        mz_pac.dy = ny;
-      } else if (!mz_open(r + mz_pac.dy, c + mz_pac.dx)) {
-        mz_pac.dx = 0;
-        mz_pac.dy = 0;
-      }
-    }
-  }
-  if (mz_pac.dx || mz_pac.dy) {
-    int r = mz_row(&mz_pac), c = mz_col(&mz_pac);
-    if (mz_centred(&mz_pac) && !mz_open(r + mz_pac.dy, c + mz_pac.dx)) {
-      mz_pac.dx = 0;
-      mz_pac.dy = 0;
-    } else {
-      mz_step_ent(&mz_pac);
-    }
-  }
-
-  // --- Ghosts: greedy toward Pac-Man, no reversing unless cornered.
-  for (int i = 0; i < MZ_GHOSTS; i++) {
-    MzEnt *g = &mz_gh[i];
-    if (mz_centred(g)) {
-      int r = mz_row(g), c = mz_col(g);
-      static const int8_t dr[4] = {-1, 1, 0, 0}, dc[4] = {0, 0, -1, 1};
-      int best = -1, bestd = 0x7FFFFFFF;
-      bool chase = (esp_random() % 100u) < 80u;  // 20% random, or they lock together
-      for (int k = 0; k < 4; k++) {
-        int nr = r + dr[k], nc = c + dc[k];
-        if (!mz_open(nr, nc)) continue;
-        if (dc[k] == -g->dx && dr[k] == -g->dy) continue;  // no U-turn
-        int ddx = mz_cx(nc) - mz_pac.px, ddy = mz_cy(nr) - mz_pac.py;
-        int d = chase ? (ddx * ddx + ddy * ddy) : (int)(esp_random() % 100000u);
-        if (d < bestd) { bestd = d; best = k; }
-      }
-      if (best < 0) { g->dx = (int8_t)-g->dx; g->dy = (int8_t)-g->dy; }
-      else { g->dx = (int8_t)dc[best]; g->dy = (int8_t)dr[best]; }
-    }
-    int r = mz_row(g), c = mz_col(g);
-    if (mz_centred(g) && !mz_open(r + g->dy, c + g->dx)) continue;
-    mz_step_ent(g);
-  }
-}
-
-// Walls as solid blocks inset by 1 px, so adjacent wall cells read as one mass but
-// the lattice still shows. Pellets are small discs on the open cells.
-static void mz_draw_board(void) {
-  for (int r = 0; r < MZ_ROWS; r++) {
-    for (int c = 0; c < MZ_COLS; c++) {
-      int x0 = MZ_OX + c * MZ_CELL, y0 = MZ_OY + r * MZ_CELL;
-      if (mz_wall[r][c]) {
-        fill_rect(x0, y0, x0 + MZ_CELL - 2, y0 + MZ_CELL - 2, BLACK);
-      } else if (mz_dot[r][c]) {
-        fill_disc(x0 + MZ_CELL / 2, y0 + MZ_CELL / 2, 2);
-      }
-    }
-  }
-}
-
-static void mz_bg_rebuild(void) {
-  paint_bind(mz_bg);
-  Paint_Clear(WHITE);
-  mz_draw_board();
-  paint_bind(ImageBW);
-}
-
-static void mz_bg_clear_dot(int r, int c) {
-  paint_bind(mz_bg);
-  int x = MZ_OX + c * MZ_CELL + MZ_CELL / 2;
-  int y = MZ_OY + r * MZ_CELL + MZ_CELL / 2;
-  fill_rect(x - 3, y - 3, x + 3, y + 3, WHITE);  // pellet is r=2, so 7x7 covers it
-  paint_bind(ImageBW);
-}
-
-// Ghost: domed top, straight flanks, zig-zag skirt, two white eyes with pupils.
-// `shade` is a 4x4 Bayer threshold, which is how four "colours" survive a 1-bit
-// panel — solid through to light stipple, distinguishable at a glance on glass.
-static void draw_ghost(int cx, int cy, int R, uint8_t shade) {
-  const int foot = R / 3;
-  for (int dy = -R; dy <= R; dy++) {
-    int y = cy + dy;
-    if (y < 0 || y >= PH) continue;
-    int hw;
-    if (dy < 0) {  // dome
-      int q = R * R - dy * dy;
-      hw = 0;
-      while ((hw + 1) * (hw + 1) <= q) hw++;
-    } else {
-      hw = R;  // straight flanks
-    }
-    for (int dx = -hw; dx <= hw; dx++) {
-      // Skirt: cut alternate notches out of the bottom `foot` rows.
-      if (dy > R - foot) {
-        int seg = (dx + R) / foot;
-        if (seg & 1) {
-          if (dy > R - foot + (foot - 1) - ((dx + R) % foot >= foot / 2 ? 0 : 0)) continue;
-        }
-      }
-      int x = cx + dx;
-      if (x < 0 || x >= PW) continue;
-      if (kBayer4[y & 3][x & 3] < shade) Paint_SetPixel((uint16_t)x, (uint16_t)y, BLACK);
-    }
-  }
-  // Eyes, always solid white with a solid pupil so they read against any shade.
-  int er = R / 3, ey = cy - R / 3;
-  for (int s = -1; s <= 1; s += 2) {
-    int ex = cx + s * (R / 2);
-    for (int dy = -er; dy <= er; dy++)
-      for (int dx = -er; dx <= er; dx++) {
-        if (dx * dx + dy * dy > er * er) continue;
-        int x = ex + dx, y = ey + dy;
-        if (x < 0 || x >= PW || y < 0 || y >= PH) continue;
-        Paint_SetPixel((uint16_t)x, (uint16_t)y, WHITE);
-      }
-    fill_disc(ex + s * (er / 2), ey, er / 2 + 1);
-  }
-}
-
+// A Ms Pac-Man maze demo ("CircleMan") used to live here. It is gone from this
+// driver: every clear, flush, seed and mode change redrew it, the board booted
+// straight into playing it, and the burn-in equalizer ended up flashing it
+// between its own cycles. The game has its own tree outside fastwave.
 static void render_frame_static(void) {
-  // Blit the template instead of clearing to white and re-rasterising the maze.
-  paint_bind(ImageBW);
-  memcpy(ImageBW, mz_bg, sizeof(ImageBW));
+  paint_begin();   // white
   if (g_settle_delay) {
     g_settle_delay--;
     if (g_settle_delay == 4) g_label_settle = 3;  // one late, accurate refresh
@@ -1022,72 +733,12 @@ static void render_frame_static(void) {
     set_label();
     g_label_settle--;
   }
-  draw_hud();  // last, so its white pad knocks the maze back out from under the text
-}
-
-// Starfish-flare UAP: five fat radiating arms, one arm aimed along the direction
-// of travel — so a point LEADS and the notch between the two rear arms TRAILS.
-//
-// Polar boundary, not a sprite. It therefore scales with `radius N` and can be
-// aimed at an arbitrary angle, where a bitmap has to snap to multiples of 90
-// degrees or be resampled into mush.
-//
-// Ms Pac-Man, mouth pointing along (vx, vy) — nose-first, so the open wedge LEADS
-// and the round back TRAILS.
-//
-// Procedural, not a bitmap: the wedge is an excluded angular sector with its vertex
-// at the centre, which is exactly what Pac-Man's mouth is, and it can therefore be
-// aimed at any angle instead of snapping to multiples of 90 degrees the way a
-// sprite must. The bow is what makes her Ms — two small discs set off the head at
-// 90 degrees to the heading, so it rotates with her.
-#define PAC_MOUTH_DEG 38.0f  // half-angle of the open wedge
-#define TWO_PI_F 6.2831853f
-#define PI_F 3.14159265f
-
-
-static void draw_pacman(int cx, int cy, int R, int vx, int vy) {
-  const float t0 = atan2f((float)vy, (float)vx);
-  const float mouth = PAC_MOUTH_DEG * PI_F / 180.0f;
-  const int r2 = R * R;
-
-  for (int dy = -R; dy <= R; dy++) {
-    int y = cy + dy;
-    if (y < 0 || y >= PH) continue;
-    for (int dx = -R; dx <= R; dx++) {
-      if (dx * dx + dy * dy > r2) continue;
-      // Angle away from the heading, wrapped to [-pi, pi]. Inside the wedge is
-      // MOUTH, so it is left white.
-      float d = atan2f((float)dy, (float)dx) - t0;
-      if (d > PI_F) d -= TWO_PI_F;
-      else if (d < -PI_F) d += TWO_PI_F;
-      if (fabsf(d) < mouth) continue;
-      int x = cx + dx;
-      if (x < 0 || x >= PW) continue;
-      Paint_SetPixel((uint16_t)x, (uint16_t)y, BLACK);
-    }
-  }
-
-  // Bow: two lobes at 90 degrees off the heading, sitting on the crown. Scaled
-  // off R so it survives `box N`.
-  int br = R / 3;
-  if (br < 2) br = 2;
-  float bt = t0 - PI_F / 2.0f;  // "up" relative to travel
-  float bd = (float)R * 0.92f;
-  for (int side = -1; side <= 1; side += 2) {
-    float a = bt + (float)side * 0.42f;
-    int bxp = cx + (int)(cosf(a) * bd);
-    int byp = cy + (int)(sinf(a) * bd);
-    fill_disc(bxp, byp, br);
-  }
+  draw_hud();
 }
 
 static void render_frame(void) {
-  render_frame_static();  // maze, pellets, then the HUD with its white pad
-  // Ghosts first, Pac-Man last, so she passes over them rather than under.
-  for (int i = 0; i < MZ_GHOSTS; i++)
-    draw_ghost(mz_gh[i].px, mz_gh[i].py, MZ_CELL / 2 - 2, mz_gh[i].shade);
-  draw_pacman(mz_pac.px, mz_pac.py, MZ_CELL / 2 - 2, mz_pac.dx ? mz_pac.dx : 0,
-              mz_pac.dy ? mz_pac.dy : (mz_pac.dx ? 0 : -1));
+  render_frame_static();
+  for (int i = 0; i < NBALL; i++) fill_disc(bx[i], by[i], g_radius);
 }
 
 // ---- panel ------------------------------------------------------------------
@@ -1204,9 +855,9 @@ static void draw_circle_field(void) {
 // EPD_LoadWhiteBothPlanes writes RAM only.
 //
 // That mismatch is the entire effect. From here a differential update drives only
-// the pixels the bench frame actually changes: Ms Pac-Man and the HUD. A pixel she
+// the pixels the bench frame actually changes: the disc and the HUD. A pixel it
 // has just moved off is NEW=white / OLD=black, so it gets driven white and whatever
-// circle was underneath is gone. A pixel she never reaches has old == new, gets no
+// circle was underneath is gone. A pixel it never reaches has old == new, gets no
 // drive at all, and keeps its circle indefinitely. Nothing in the render path knows
 // the circles exist — the erasing is a property of the differential waveform.
 static void apply_mode_wave(void);
@@ -1637,7 +1288,7 @@ static void show_frame(void) {
 // The point is normalisation, not motion. An incomplete white transition parks a
 // pixel at a fixed grey and holds it there — measured on glass: the shade does not
 // drift once abandoned. So a background that has been swept is uniformly that grey,
-// and Pac-Man's wake afterwards is the SAME shade as everything around it. The
+// and the disc's wake afterwards is the SAME shade as everything around it. The
 // artefact stops being visible because there is no pristine white left to contrast
 // it against.
 //
@@ -1672,7 +1323,19 @@ static void bar_sweep(void) {
   Serial.println("SWEEP done — background normalised");
 }
 
-static void advance_motion(void) { mz_advance(); }
+// One disc bouncing off the panel edges, step_x / step_y per frame (step_mag
+// along its heading, so consecutive positions abut and never overlap).
+static void advance_motion(void) {
+  const int lo = g_radius + 1;
+  for (int i = 0; i < NBALL; i++) {
+    bx[i] += bsx[i] * step_x(i);
+    by[i] += bsy[i] * step_y(i);
+    if (bx[i] < lo) { bx[i] = lo; bsx[i] = 1; }
+    if (bx[i] > PW - lo - 1) { bx[i] = PW - lo - 1; bsx[i] = -1; }
+    if (by[i] < lo) { by[i] = lo; bsy[i] = 1; }
+    if (by[i] > PH - lo - 1) { by[i] = PH - lo - 1; bsy[i] = -1; }
+  }
+}
 
 // Start positions are randomised every boot. A fixed start pose meant the same
 // pixels took a hard white->black drive on every single power-up, and that
@@ -2567,50 +2230,69 @@ static void stream_apply(const StreamSlot *s) {
 // Composite what the panel shows: clean video, then the HUD. ImageBW is scratch
 // as far as the delta chain is concerned.
 //
-// A white bar HUD_BAR px tall across the top of the portrait canvas, MODE at
-// its left end and fps at its right, size 24. The host is told the bar height
-// in the STREAM banner (hud=N) and frames the video into the area below it,
-// so no picture plays under the bar. (Was two lines at size 48 stacked
-// top-left, then two padded boxes with a sliver of video between them.)
+// A white bar HUD_BAR px tall across the top of the picture as the viewer
+// sees it, MODE at its left end and fps at its right, size 24, each tag tight
+// to its ink. The host is told the bar height in the STREAM banner (hud=N) and
+// frames the video into the rest, so no picture plays under the bar. (Was two
+// lines at size 48 stacked top-left, then two padded boxes with a sliver of
+// video between them.)
+//
+// The bar follows the picture. `hud R` (R = 0/90/180/270, the host's
+// clockwise turn of the picture within the portrait canvas) picks the Paint
+// rotation the HUD is drawn in: (90 + R) % 360, since rotation 90 is the
+// canvas itself and each further 90 moves the viewer's "up" one edge
+// clockwise round the glass (native right, bottom, left, top).
 //
 // When the text changes (about once a second) it is rasterised into g_hud_fb
 // with headroom and each tag's ink box is measured there. Per frame the bar is
-// whitened and each tag pasted pixel by pixel, centred in the bar's height:
-// ~12000 pixels, well under a millisecond.
+// whitened and each tag pasted pixel by pixel, centred in the bar's height.
 #define HUD_SIZE 24
 #define HUD_MARGIN 1          // white px between the ink and the tag's edge
 #define HUD_BAR (HUD_SIZE + 2 * HUD_MARGIN)
 static uint8_t g_hud_fb[(uint32_t)EPD_H * FB_WBYTES];
 static char g_shud_txt[24] = "";
 static bool g_shud_valid = false;
+static int g_hud_r = 0;       // picture turn in the canvas, set by `hud R`
 typedef struct { int sx0, sy0, sx1, sy1, dx0, dy0; bool on; } HudTag;
 static HudTag g_hud_tag[2];
 
-// Portrait pixel access on a raw column-major buffer, rotation 90: native
-// X = 799 - y, Y = x, MSB-first in the byte, 0 = black. Only used for y < 396,
-// so the cascade-seam offset never applies.
-static inline bool fb_black(const uint8_t *fb, int x, int y) {
-  int X = EPD_W - 1 - y;
-  return !(fb[FB_IDX(x, X >> 3)] & (uint8_t)(0x80 >> (X & 7)));
+// Paint's own mapping (EPD.cpp Paint_SetPixel), cascade seam included: a
+// logical coordinate past 395 along the long side skips the 8 dead columns.
+static inline void view_xy(int rot, int x, int y, int *X, int *Y) {
+  switch (rot) {
+    case 0:   if (x >= 396) x += 8; *X = x;             *Y = y;              break;
+    case 180: if (x >= 396) x += 8; *X = EPD_W - 1 - x; *Y = EPD_H - 1 - y;  break;
+    case 270: if (y >= 396) y += 8; *X = y;             *Y = EPD_H - 1 - x;  break;
+    default:  if (y >= 396) y += 8; *X = EPD_W - 1 - y; *Y = x;              break;
+  }
 }
-static inline void fb_put(uint8_t *fb, int x, int y, bool black) {
-  int X = EPD_W - 1 - y;
-  uint8_t *p = &fb[FB_IDX(x, X >> 3)];
+static inline int view_w(int rot) { return (rot == 0 || rot == 180) ? PH : PW; }
+static inline bool fb_black(const uint8_t *fb, int rot, int x, int y) {
+  int X, Y;
+  view_xy(rot, x, y, &X, &Y);
+  return !(fb[FB_IDX(Y, X >> 3)] & (uint8_t)(0x80 >> (X & 7)));
+}
+static inline void fb_put(uint8_t *fb, int rot, int x, int y, bool black) {
+  int X, Y;
+  view_xy(rot, x, y, &X, &Y);
+  uint8_t *p = &fb[FB_IDX(Y, X >> 3)];
   uint8_t m = (uint8_t)(0x80 >> (X & 7));
   if (black) *p &= (uint8_t)~m; else *p |= m;
 }
+static inline int hud_rot(void) { return (90 + g_hud_r) % 360; }
 
-// Draw `str` with its cell at (x, y) in g_hud_fb, measure the ink, and return
-// the box to paste: ink + margin, destined for the top edge, at the left or
-// right corner.
+// Draw `str` with its cell at (x, y) in g_hud_fb (Paint already bound at
+// hud_rot()), measure the ink, and return the box to paste: ink + margin,
+// centred in the bar, at its left or right end.
 static HudTag hud_tag(int x, int y, const char *str, bool right) {
   HudTag t = {};
+  const int rot = hud_rot(), vw = view_w(rot);
   int w = (int)strlen(str) * (HUD_SIZE / 2);
   EPD_ShowString((uint16_t)x, (uint16_t)y, str, HUD_SIZE, BLACK);
-  int ax = PW, ay = PH, bx = -1, by = -1;
+  int ax = vw, ay = HUD_SIZE + y, bx = -1, by = -1;
   for (int yy = y; yy < y + HUD_SIZE; yy++)
-    for (int xx = x; xx < x + w && xx < PW; xx++)
-      if (fb_black(g_hud_fb, xx, yy)) {
+    for (int xx = x; xx < x + w && xx < vw; xx++)
+      if (fb_black(g_hud_fb, rot, xx, yy)) {
         if (xx < ax) ax = xx;
         if (xx > bx) bx = xx;
         if (yy < ay) ay = yy;
@@ -2623,20 +2305,23 @@ static HudTag hud_tag(int x, int y, const char *str, bool right) {
   t.sy1 = by + HUD_MARGIN;
   t.dy0 = (HUD_BAR - (t.sy1 - t.sy0 + 1)) / 2;
   if (t.dy0 < 0) t.dy0 = 0;
-  t.dx0 = right ? PW - (t.sx1 - t.sx0 + 1) : 0;
+  t.dx0 = right ? vw - (t.sx1 - t.sx0 + 1) : 0;
   t.on = true;
   return t;
 }
 
 static void hud_tag_paste(const HudTag &t) {
   if (!t.on) return;
+  const int rot = hud_rot();
   for (int y = 0; y <= t.sy1 - t.sy0; y++)
     for (int x = 0; x <= t.sx1 - t.sx0; x++)
-      fb_put(ImageBW, t.dx0 + x, t.dy0 + y, fb_black(g_hud_fb, t.sx0 + x, t.sy0 + y));
+      fb_put(ImageBW, rot, t.dx0 + x, t.dy0 + y,
+             fb_black(g_hud_fb, rot, t.sx0 + x, t.sy0 + y));
 }
 
 static void stream_compose(void) {
   memcpy(ImageBW, g_vid, sizeof(ImageBW));
+  const int rot = hud_rot(), vw = view_w(rot);
 
   char want[24];
   snprintf(want, sizeof(want), "%u|%s", (unsigned)g_wp.drive_tp,
@@ -2645,7 +2330,7 @@ static void stream_compose(void) {
     memcpy(g_shud_txt, want, sizeof(g_shud_txt));
     g_shud_valid = true;
     memset(g_hud_fb, 0xFF, sizeof(g_hud_fb));
-    paint_bind(g_hud_fb);
+    Paint_NewImage(g_hud_fb, EPD_W, EPD_H, (uint16_t)rot, WHITE);
     // Rasterised away from the edges so the margin always has room; the
     // paste moves each box into its corner.
     const int pad = 4;
@@ -2654,11 +2339,11 @@ static void stream_compose(void) {
     g_hud_tag[0] = hud_tag(pad, pad, line, false);
     snprintf(line, sizeof(line), "%s fps", g_fps_num[0] ? g_fps_num : "--");
     int w = (int)strlen(line) * (HUD_SIZE / 2);
-    g_hud_tag[1] = hud_tag(PW - pad - w, pad, line, true);
+    g_hud_tag[1] = hud_tag(vw - pad - w, pad, line, true);
     paint_bind(ImageBW);
   }
   for (int y = 0; y < HUD_BAR; y++)
-    for (int x = 0; x < PW; x++) fb_put(ImageBW, x, y, false);
+    for (int x = 0; x < vw; x++) fb_put(ImageBW, rot, x, y, false);
   hud_tag_paste(g_hud_tag[0]);
   hud_tag_paste(g_hud_tag[1]);
 }
@@ -2699,10 +2384,10 @@ static void stream_run(bool v2) {
   // map=rle says this is `stream2`; hud=N is the white bar's height in portrait
   // rows, which the host leaves white so no video plays under it.
   Serial.printf("STREAM ready baud=%lu bmp=%u plane=%lu drive=%u panel=crow-579 "
-                "map=%s hud=%d\n",
+                "map=%s hud=%d hudrot=%d\n",
                 (unsigned long)STREAM_BAUD, (unsigned)STREAM_BMP_BYTES,
                 (unsigned long)PLANE_BYTES, (unsigned)g_wp.drive_tp,
-                v2 ? "rle" : "raw", HUD_BAR);
+                v2 ? "rle" : "raw", HUD_BAR, g_hud_r);
   Serial.flush();
   Serial.updateBaudRate(STREAM_BAUD);
   delay(20);
@@ -2797,12 +2482,13 @@ static void print_help(void) {
   Serial.println("  clear       one GC full clear (only intentional flash)");
   Serial.println("  white|black stop the bench, hold the panel at one level (no flash)");
   Serial.println("  speed N     % of one shape-length per frame (10..400; 100 = no overlap)");
-  Serial.println("  box N       Ms Pac-Man box in px (12..120) — sets the step too");
+  Serial.println("  box N       bench disc box in px (12..120) — sets the step too");
   Serial.println("  radius N    same dial in radius units (6..60)");
   Serial.println("  field       re-seed the dithered circle field without clearing");
   Serial.println("  sweep       one bar pass top-to-bottom: normalises the background shade");
   Serial.println("  stream      play delta-encoded video from the host (raises baud to 2M)");
   Serial.println("  stream2     same, change map RLE-compressed (Ink Flow uses this)");
+  Serial.println("  hud R       stream HUD follows a picture turned R = 0|90|180|270 clockwise");
   Serial.println("  bar N       sweep bar height, % of sprite box (10..200, default 80)");
   Serial.println("  spi bitbang | spi hw [MHz]   switch transport live");
   Serial.println("  flush [N]   deep de-ghost, N black/white cycles (default 3)");
@@ -2943,6 +2629,20 @@ static void handle_cmd(char *s) {
   }
   if (!strcmp(s, "stream") || !strcmp(s, "stream2")) {
     stream_run(s[6] == '2');
+    return;
+  }
+  // `hud R` — which way the host has turned the picture in the portrait
+  // canvas (0/90/180/270 clockwise), so the stream HUD bar sits at the
+  // viewer's top. Takes effect at the next `stream`.
+  if (!strncmp(s, "hud ", 4)) {
+    int v = atoi(s + 4);
+    if (v != 0 && v != 90 && v != 180 && v != 270) {
+      Serial.println("ERR hud 0|90|180|270");
+      return;
+    }
+    g_hud_r = v;
+    g_shud_valid = false;
+    Serial.printf("OK hud=%d\n", v);
     return;
   }
   if (!strcmp(s, "sweep")) {
@@ -3374,7 +3074,10 @@ static void handle_cmd(char *s) {
     Serial.printf("deghost x%d — this WILL flash, it is the point\n", v);
     epd_deghost((uint8_t)v);
     epd_full_clear();
-    render_frame_static();
+    // Ends on plain white: no bench readout. The equalizer and Park call this
+    // in a loop, and anything drawn here showed up between their cycles.
+    g_running = false;
+    memset(ImageBW, 0xFF, sizeof(ImageBW));
     epd_seed();
     apply_mode_wave();  // deghost + clear + seed all run the OTP path
     Serial.println("OK flush");
@@ -3516,6 +3219,37 @@ static void drain_actions(void) {
   }
 }
 
+// ---- boot splash ------------------------------------------------------------
+// Shows BOOT_SPLASH_TEXT (configured at the top of this file), then seeds the
+// panel back to white. Each is one seed: OLD written inverted so every pixel
+// is driven, then OLD = NEW. Leaves ImageBW white and the planes agreeing.
+static_assert(BOOT_SPLASH_ROT == 0 || BOOT_SPLASH_ROT == 90 ||
+              BOOT_SPLASH_ROT == 180 || BOOT_SPLASH_ROT == 270,
+              "BOOT_SPLASH_ROT must be 0, 90, 180 or 270");
+static void boot_splash(void) {
+  const char *msg = BOOT_SPLASH_TEXT;
+  const int len = (int)strlen(msg);
+  if (!len) return;
+  const int rot = BOOT_SPLASH_ROT;
+  const int vw = (rot == 0 || rot == 180) ? PH : PW;   // width as seen
+  const int vh = (rot == 0 || rot == 180) ? PW : PH;
+  // Largest available size not above BOOT_SPLASH_SIZE that fits the width.
+  static const int kSizes[] = {48, 24, 16, 12};
+  int size = 12;
+  for (int s : kSizes)
+    if (s <= BOOT_SPLASH_SIZE && len * (s / 2) <= vw - 8) { size = s; break; }
+  memset(ImageBW, 0xFF, sizeof(ImageBW));
+  Paint_NewImage(ImageBW, EPD_W, EPD_H, (uint16_t)rot, WHITE);
+  int x = (vw - len * (size / 2)) / 2;
+  if (x < 0) x = 0;
+  EPD_ShowString((uint16_t)x, (uint16_t)((vh - size) / 2), msg, (uint16_t)size, BLACK);
+  paint_bind(ImageBW);
+  epd_seed();
+  delay(BOOT_SPLASH_MS);
+  memset(ImageBW, 0xFF, sizeof(ImageBW));
+  epd_seed();
+}
+
 // ---- arduino ----------------------------------------------------------------
 void setup(void) {
   // 64 KB of UART receive buffer, and it MUST be set before begin().
@@ -3593,7 +3327,6 @@ void setup(void) {
   g_wp.volt_mask = (uint8_t)(WV_V_VCOM | WV_V_SRC);
 
   reset_balls();
-  mz_reset();  // carve the maze and place Pac-Man + ghosts
 
   Serial.println();
   Serial.println("=== CrowPanel 5.79 circle / plane-diff / waveform bench ===");
@@ -3607,21 +3340,26 @@ void setup(void) {
   // undoes charge accumulated by earlier fixed-position drives.
   epd_deghost(2);
   epd_full_clear();
-  // Straight into the custom waveform at MODE 8, already running. There is
-  // nothing to set up and no run to start or lose.
+  // Custom waveform armed at MODE 10, NOT running: the board waits on a white
+  // panel for the host. `run` (or RIGHT) starts the bench disc by hand.
+  // Mode set quietly: enter_mode() would seed the bench readout onto the
+  // glass first. The splash's own seeds leave the planes coherent instead.
   g_wp.drive_tp = 10;
-  enter_mode(mode_with_wave(WV_CUSTOM), true);
-  // Second clear, then normalise the background: one bar pass drives every pixel
-  // through the same incomplete transition, so Pac-Man's wake afterwards matches its
-  // surroundings and stops reading as a trail.
-  epd_full_clear();
-  apply_mode_wave();  // the clear runs the vendor OTP path and drops the custom LUT
-  bar_sweep();
-  g_running = true;
+  g_mode = mode_with_wave(WV_CUSTOM);
+  g_mode_frames = 0;
+  g_mode_busy_sum = 0;
+  boot_splash();
+  if (!BOOT_SPLASH_TEXT[0]) {           // no splash: still leave a seeded white
+    memset(ImageBW, 0xFF, sizeof(ImageBW));
+    epd_seed();
+  }
+  apply_mode_wave();  // the seeds run the vendor path and drop the custom LUT
+  if (EPD_AnalogIsOn()) analog_power(false);  // idle is rails down
+  g_running = false;
 
   xTaskCreatePinnedToCore(btn_task, "btn", 2048, nullptr, 2, nullptr, 0);
 
-  Serial.println("READY — press RIGHT to run");
+  Serial.println("READY — idle on white; `run` or RIGHT for the bench disc");
 }
 
 void loop(void) {

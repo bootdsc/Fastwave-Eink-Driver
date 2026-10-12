@@ -190,15 +190,29 @@ def make_fps_plate(fps):
     return np.asarray(plate, dtype=np.uint8)
 
 
-def blit_fps_plate(gray, plate, portrait):
-    """Cheap slice write. No PIL. Sits in the video pane, not the blank band."""
+def blit_fps_plate(gray, plate, portrait, rotate=0):
+    """Cheap slice write. No PIL. Sits in the video pane, not the blank band.
+
+    `rotate` turns the badge with the picture (clockwise, as compose_geo
+    turns the source) and walks it to the matching corner, so it stays in
+    the same place and reads upright however the panel is held. The native
+    plane is the logical one turned 90 clockwise, so a clockwise turn there is
+    a clockwise turn here: the corner moves clockwise round the array.
+    """
+    q = (int(rotate) % 360) // 90
+    if q:
+        plate = np.rot90(plate, k=-q)
     ph, pw = plate.shape
-    h = gray.shape[0]
+    h, w = gray.shape
+    top, bottom = 6, max(0, h - ph - 6)
+    left, right = 6, max(0, w - pw - 6)
+    # Corners in clockwise order, starting from the one used at rotate 0.
     if portrait:
-        y0, x0 = 6, 6
+        corners = ((top, left), (top, right), (bottom, right), (bottom, left))
     else:
-        y0, x0 = max(0, h - ph - 6), 6
-    if y0 + ph > h or x0 + pw > gray.shape[1]:
+        corners = ((bottom, left), (top, left), (top, right), (bottom, right))
+    y0, x0 = corners[q]
+    if y0 + ph > h or x0 + pw > w:
         return gray
     gray[y0:y0 + ph, x0:x0 + pw] = plate
     return gray
@@ -325,7 +339,7 @@ def compose_portrait(im, letterbox=False):
     return to_native(fit_wh(im, LW, LH, letterbox=letterbox, pad=0))
 
 
-def compose_geo(im, knobs, geo):
+def compose_geo(im, knobs, geo, rot=None):
     """Source frame -> panel-native plane, with framing applied.
 
     fit   True  = letterbox, whole frame visible, bars in `pad`
@@ -337,10 +351,18 @@ def compose_geo(im, knobs, geo):
           option. Solid black/white still pulse to the opposite polarity
           for ~0.25 s every minute so they do not sit skipped for an hour.
 
-    All three are read per frame by the encoder thread, so they are live.
+    rotate (knobs.rotate) 0/90/180/270, the picture turned clockwise on the
+          glass from the panel's standard view. Done to the source before
+          framing, so Fill and Fit fill the turned frame. `rot` overrides it
+          for a caller that has already turned the source (the CrowPanel).
+
+    All of these are read per frame by the encoder thread, so they are live.
     """
     if knobs.mirror:
         im = im.transpose(Image.FLIP_LEFT_RIGHT)
+    r = int(getattr(knobs, "rotate", 0) or 0) % 360 if rot is None else rot
+    if r:
+        im = im.rotate(-r, expand=True)       # PIL turns anticlockwise
     z = int(getattr(knobs, "zoom", 100) or 100)
     if z > 100:
         w, h = im.size
@@ -947,6 +969,8 @@ class Knobs:
         self.zoom = int(getattr(args, "zoom", 100) or 100)
         self.pad = int(getattr(args, "pad", 0) or 0)
         self.landscape = bool(args.landscape)
+        # Clockwise turn of the picture from the panel's standard view.
+        self.rotate = int(getattr(args, "rotate", 0) or 0) % 360
         self.test = bool(args.test)
         self.screen = bool(getattr(args, "screen", False))
         self.region = getattr(args, "region", None)
@@ -1683,11 +1707,16 @@ def detect_panel(port, forced="auto"):
     return usb or "xiao-426"
 
 
-# Anticlockwise pre-rotation of the source before it is framed into the
-# CrowPanel's 272 x 792 portrait canvas, which reaches the glass turned 90
-# clockwise. 90 showed the picture a quarter turn short as the panel is held;
-# 0 is 90 clockwise from that, judged on glass 2026-10-12.
-CROW_ROT = 0
+# The CrowPanel's standard view, as a clockwise turn of the picture within
+# its 272 x 792 portrait canvas (the canvas reaches the glass turned 90
+# clockwise). 180 is how the panel is normally held, judged on glass
+# 2026-10-12. The Rotation knob turns the picture further from there.
+CROW_STD_ROT = 180
+
+
+def crow_turn(knobs):
+    """Total clockwise turn of the picture within the CrowPanel canvas."""
+    return (CROW_STD_ROT + int(getattr(knobs, "rotate", 0) or 0)) % 360
 
 
 def open_serial_crow(port):
@@ -1777,6 +1806,10 @@ def enter_stream_crow(s, knobs):
     if not ok:
         print("no OK drive:\n" + raw.decode("utf-8", "replace")[-300:])
         return False
+    # Tell the firmware which way the picture is turned, so its HUD bar sits
+    # at the viewer's top. Older firmware answers ERR and draws it unturned.
+    s.write(("hud %d\n" % crow_turn(knobs)).encode())
+    wait_bytes(s, b"hud", 2.0, to_nl=True)
     return crow_reenter(s, knobs)
 
 
@@ -1809,7 +1842,8 @@ def encode_one(src, prev, prev_g, prev_bit, knobs, geo, tone_lut, thresh,
     g = tone_lut[np.clip(src, 0, 255)]
     if fps_plate is not None:
         g = g.copy()
-        blit_fps_plate(g, fps_plate, portrait=geo.portrait and not knobs.landscape)
+        blit_fps_plate(g, fps_plate, portrait=geo.portrait and not knobs.landscape,
+                       rotate=getattr(knobs, "rotate", 0))
     bit = g > thresh
     bit = np.where(g <= knobs.black, False, bit)
     bit = np.where(g >= knobs.white, True, bit)
@@ -2090,8 +2124,12 @@ class CrowEncoder:
       regular hitch). A rolling band of ROLL_BYTES is re-sent each frame
       instead, which heals a desynchronised byte within ROLL_FRAMES frames at
       ~2 ms of wire.
-    - The top `hud` rows stay white and the picture is framed below them, so
-      no video plays under the firmware's HUD bar.
+    - The `hud` rows at the viewer's top stay white and the picture is framed
+      into the rest, so no video plays under the firmware's HUD bar.
+
+    The turn (crow_turn) is fixed for the life of the encoder: the firmware
+    draws its HUD for the turn it was given at stream entry, so a Rotation
+    change re-enters the stream rather than turning mid-flight.
     """
 
     ROLL_FRAMES = 64
@@ -2100,10 +2138,23 @@ class CrowEncoder:
         import encode_video as crow_enc
         self.ce = crow_enc
         self.knobs, self.cam = knobs, cam
-        self.hud = max(0, min(int(hud), 200))
+        self.hud = h = max(0, min(int(hud), 200))
         self.rle = rle
+        self.turn = crow_turn(knobs)
         self.xmap = crow_enc.portrait_x_map()
-        self.area = Geo("crow-area", 272, 792 - self.hud, 272, 792 - self.hud, False)
+        # The bar lies along the viewer's top, which is the canvas top, right,
+        # bottom or left edge for a turn of 0, 90, 180 or 270.
+        if self.turn in (0, 180):
+            aw, ah = 272, 792 - h
+        else:
+            aw, ah = 272 - h, 792
+        self.area = Geo("crow-area", aw, ah, aw, ah, False)
+        self.slot = {
+            0: (slice(h, 792), slice(0, 272)),
+            90: (slice(0, 792), slice(0, 272 - h)),
+            180: (slice(0, 792 - h), slice(0, 272)),
+            270: (slice(0, 792), slice(h, 272)),
+        }[self.turn]
         self.canvas = np.full((792, 272), 255, dtype=np.uint8)
         self.prev = np.full(crow_enc.PLANE_BYTES, 0xFF, dtype=np.uint8)
         self.prev_g = None
@@ -2139,10 +2190,11 @@ class CrowEncoder:
         im = self._source()
         if im is None:
             return None
-        if CROW_ROT:
-            im = im.rotate(CROW_ROT, expand=True)
-        # Framing into the area below the HUD bar; the bar rows stay white.
-        self.canvas[self.hud:, :] = compose_geo(im, k, self.area)
+        # Turn the source, then frame it into the area beside the HUD bar; the
+        # bar stays white. compose_geo must not turn it a second time.
+        if self.turn:
+            im = im.rotate(-self.turn, expand=True)
+        self.canvas[self.slot] = compose_geo(im, k, self.area, rot=0)
         key = (k.gamma, k.contrast, k.white, k.black, int(k.dither), k.bias,
                bool(k.invert))
         if key != self.tone_key:
@@ -2321,6 +2373,8 @@ def main():
     ap.add_argument("--pad", type=int, default=0,
                     help="letterbox bars: 0 black, 255 white, -1 extend (edge pixels)")
     ap.add_argument("--landscape", action="store_true")
+    ap.add_argument("--rotate", type=int, default=0, choices=(0, 90, 180, 270),
+                    help="turn the picture clockwise from the panel's standard view")
     ap.add_argument("--no-mirror", action="store_true")
     ap.add_argument("--invert", dest="invert", action="store_true",
                     default=INVERT)

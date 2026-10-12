@@ -393,6 +393,17 @@ class App(tk.Tk):
         self.zoom = self._slider(ff, "Zoom %", 100, 400,
                                  int(self.cfg.get("zoom") or 100), 100,
                                  self._frame)
+        rr = ttk.Frame(ff)
+        rr.pack(fill="x", pady=4)
+        ttk.Label(rr, text="Rotation").pack(side="left")
+        rot0 = int(self.cfg.get("rotate") or 0)
+        self.rotv = tk.IntVar(value=rot0 if rot0 in (0, 90, 180, 270) else 0)
+        for deg in (0, 90, 180, 270):
+            ttk.Radiobutton(rr, text="%d°" % deg, variable=self.rotv, value=deg,
+                            command=self._rotate).pack(side="left", padx=8)
+        ttk.Label(rr, text="clockwise from the panel's normal view. "
+                           "90 / 270 play video sideways for a panel held the other way.",
+                  foreground=GRAY).pack(side="left", padx=8)
 
         tf = self._section(pad, "Tone / gray (live)", "tone")
         dr = ttk.Frame(tf)
@@ -777,6 +788,7 @@ class App(tk.Tk):
             fit=bool(self.fitv.get()),
             zoom=int(self.zoom.get()),
             pad=int(self.padv.get()),
+            rotate=int(self.rotv.get()),
             landscape=False,
             test=False,
             panel=self.panel_key(),
@@ -838,6 +850,7 @@ class App(tk.Tk):
             "fit": int(bool(k.fit)),
             "zoom": k.zoom,
             "pad": k.pad,
+            "rotate": k.rotate,
             "dither": k.dither,
             "equalize_min": self.eq_minutes(),
             "sections": {k: v["on"] for k, v in self._sect.items()},
@@ -918,6 +931,17 @@ class App(tk.Tk):
         k.fit = bool(self.fitv.get())
         k.pad = int(self.padv.get())
         k.zoom = int(self.zoom.get())
+
+    def _rotate(self, *_a) -> None:
+        """Live on the XIAO panels. The 5.79" firmware draws its HUD bar for
+        the turn it was given at stream entry, so there it re-enters."""
+        self.cfg["rotate"] = int(self.rotv.get())
+        if self.stream is None or not self.stream.running:
+            return
+        k = self.stream.knobs
+        k.rotate = int(self.rotv.get())
+        if getattr(k, "panel", "") == "crow-579":
+            self.stream.request_rearm()
 
     def _tone(self, *_a) -> None:
         if self.stream is None or not self.stream.running:

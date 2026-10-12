@@ -24,8 +24,17 @@ python -m esptool --chip esp32s3 -p COMx -b 460800 --before default-reset \
     --flash-size 8MB 0x0 .pio/build/wavelab/firmware.factory.bin
 ```
 
-It boots straight into MODE 10, running, showing the mode, the waveform time,
-the total and a wall-clock frame rate, plus one moving disc.
+It boots to a short "Fastwave" splash, clears to white and waits for Ink Flow.
+`run` starts the bench: one moving disc with the mode, waveform time, total and
+frame rate in the corner.
+
+## Your own boot message
+
+The splash is the BOOT SPLASH block at the top of
+[firmware/wavelab.cpp](firmware/wavelab.cpp). Change `BOOT_SPLASH_TEXT` to put your
+project's name on the panel at power-on, `BOOT_SPLASH_MS` for how long it stays up,
+or set the text to `""` to boot straight to white. Size and orientation sit in the
+same block.
 
 ## Defaults
 
