@@ -54,19 +54,14 @@ try:
 except ImportError:
     serial.tools = None  # type: ignore
 
-CROW_TOOLS = r"..\..\ssd1683-crowpanel-579\tools"
+CROW_TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "ports", "ssd1683-crowpanel-579", "tools")
 if CROW_TOOLS not in sys.path:
     sys.path.insert(0, CROW_TOOLS)
-LAST_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_stream.log")
-
-
 def fail(msg):
+    # Console only. This used to also write tools/last_stream.log; a log file
+    # outlives the run and can carry source paths, so it is gone.
     print(msg)
-    try:
-        with open(LAST_LOG, "w", encoding="utf-8") as fh:
-            fh.write(msg + "\n")
-    except Exception:
-        pass
     sys.exit(1)
 
 # Native controller RAM: 800×480 landscape. StarPilot stands the panel
@@ -857,17 +852,52 @@ def pick_screen_region(parent=None):
         w.bind("<Escape>", on_esc)
         w.bind("<F>", on_full)
         w.bind("<f>", on_full)
-    win.focus_force()
-    cv.focus_set()
-    # Grab after focus; do not use a transparent layered window with grab.
+    # The window must be MAPPED before it can be grabbed. Calling grab_set()
+    # on an unmapped window raises "grab failed: window not viewable", and
+    # swallowing that left the overlay with no grab at all -- it painted the
+    # frozen desktop, took no clicks, and went away having stored nothing.
+    # That is the "flashes up like snipping mode, then nothing" failure.
+    win.update_idletasks()
+    win.deiconify()
+    win.lift()
     try:
-        win.grab_set()
+        win.wait_visibility(win)
     except tk.TclError:
         pass
-    if owned:
-        win.mainloop()
-    else:
-        parent.wait_window(win)
+    win.focus_force()
+    cv.focus_set()
+    grabbed = False
+    for _try in range(20):
+        try:
+            win.grab_set()
+            grabbed = True
+            break
+        except tk.TclError:
+            win.update()
+            time.sleep(0.02)
+    if not grabbed:
+        # Keyboard and mouse bindings still work without an exclusive grab;
+        # say so rather than failing silently the way this used to.
+        print("region: no pointer grab (another window holds one) — "
+              "the overlay still takes clicks")
+    # A leaked grab is not a cosmetic failure: while one is held, no other
+    # window on this interpreter can take one, and every ttk combobox popdown
+    # in the app silently refuses to open. Release it whatever happens.
+    try:
+        if owned:
+            win.mainloop()
+        else:
+            parent.wait_window(win)
+    finally:
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            if win.winfo_exists():
+                win.destroy()
+        except Exception:
+            pass
     return out["box"]
 
 
@@ -1194,6 +1224,7 @@ def open_source(src, knobs):
 def open_serial(port):
     last = None
     for _ in range(10):
+        s = None
         try:
             s = serial.Serial()
             s.port, s.baudrate = port, BAUD
@@ -1215,19 +1246,27 @@ def open_serial(port):
             # before `panel=` was reached -- the host then fell back to
             # xiao-426 and enter_stream refused the mismatch. A clean failure,
             # but a needless one, and it hit every other run.
+            # Bounded: a firmware that logs continuously (the CrowPanel demo
+            # prints EAT / RESULT lines every few frames) never goes quiet, and
+            # an unbounded wait-for-quiet hung Connect forever. Short reads,
+            # stop on quiet OR once the STATUS line is in, hard cap regardless.
             raw = b""
+            s.timeout = 0.05
             for _attempt in range(2):
                 s.reset_input_buffer()
                 s.write(b"status\n")
                 s.flush()
-                quiet = time.time()
-                while time.time() - quiet < 0.15:
+                t_start = quiet = time.time()
+                while time.time() - quiet < 0.15 and time.time() - t_start < 1.5:
                     chunk = s.read(256)
                     if chunk:
                         raw += chunk
                         quiet = time.time()
-                if panel_from_text(raw):
+                    if b"STATUS" in raw and raw.endswith(b"\n"):
+                        break
+                if panel_from_text(raw) or b"STATUS" in raw:
                     break
+            s.timeout = 4
             s.ink_panel = panel_from_text(raw)
             s.ink_fr, s.ink_spi_hz = timing_from_text(raw)
             s.ink_status = raw.decode("utf-8", "replace").strip()
@@ -1235,6 +1274,14 @@ def open_serial(port):
             return s
         except Exception as e:
             last = e
+            # A failure AFTER open() used to leave the port open in this process,
+            # so every later attempt -- this loop's retries and every button --
+            # got "Access is denied" until the app was closed.
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
             time.sleep(0.25)
     raise last
 
@@ -1511,6 +1558,10 @@ def equalize_panel(port, minutes, panel="auto", log=None, should_stop=None,
             one("white1", b"OK white1", 8.0)
         elif panel == "xiao-426":
             one("white", b"OK white", 8.0)
+        else:
+            # `flush` leaves the 5.79" on its bench card; end on white like
+            # the other two.
+            one("white", b"OK white", 8.0)
         say("equalize done %s drives (est %s)" % (format(drives, ","),
                                                   format(expect, ",")))
         return None
@@ -1578,10 +1629,17 @@ def park_panel(port, color="white", cycles=8, panel="auto", log=None):
             ok, raw = wait_bytes(s, b"OK flush", 90.0)
             if not ok:
                 return "flush timed out:\n" + raw.decode("utf-8", "replace")[-200:]
+        if panel == "crow-579":
+            # `flush` ends on the bench card, not on white, so the hold is an
+            # explicit white or black (both added to the 5.79" firmware).
+            s.write(("%s\n" % color).encode())
+            ok, raw = wait_bytes(s, ("OK %s" % color).encode(), 30.0)
+            if not ok:
+                return "%s timed out:\n%s" % (
+                    color, raw.decode("utf-8", "replace")[-200:])
+            say("parked %s" % color)
+            return None
         if color == "black":
-            if panel == "crow-579":
-                say("park: 5.79\" flush ends white — no black hold on that port")
-                return None
             s.write(b"black\n")
             ok, raw = wait_bytes(s, b"OK black", 30.0)
             if not ok:
@@ -1625,27 +1683,56 @@ def detect_panel(port, forced="auto"):
     return usb or "xiao-426"
 
 
+# Pre-rotation for the CrowPanel portrait canvas (see encode_video.image_to_fb_rot).
+# 90 showed the picture a quarter turn short as the panel is held; 0 is 90 clockwise
+# from that, judged on glass 2026-10-12.
+CROW_ROT = 0
+
+# The portrait canvas image_to_fb_rot takes, 272 across x 792 along. Framing
+# (fill/fit, zoom, bars, mirror) is applied into this through compose_geo; it
+# is deliberately not in GEO, whose crow entry falls back to the 4.26" for the
+# preview and other xiao-shaped paths.
+CROW_CANVAS = Geo("crow-579", 272, 792, 272, 792, False)
+
+
 def open_serial_crow(port):
     s = serial.Serial()
     s.port, s.baudrate = port, 115200
     s.timeout, s.write_timeout = 4, 8
     s.dtr = s.rts = False
     s.open()
-    time.sleep(0.4)
-    s.reset_input_buffer()
+    try:
+        time.sleep(0.4)
+        s.reset_input_buffer()
+    except Exception:
+        s.close()  # never leave the port held by a half-opened handle
+        raise
     return s
 
 
 def enter_stream_crow(s, knobs):
     from play_video import reenter_stream
+    # reenter_stream reads the banner 256 bytes at a time. With the 4 s timeout
+    # from open_serial_crow, that read sat 4 s on a ~60 byte banner while the
+    # board, already at 2 Mbaud, timed out waiting for data and fell back to
+    # 115200: "STREAM done 0 frames", then a host at 2 Mbaud that never sees an
+    # ACK. Short reads here, as play_video.py itself uses.
+    s.timeout = 0.05
     s.baudrate = 115200
     time.sleep(0.05)
     s.reset_input_buffer()
     s.write(b"old 1\n")
     wait_bytes(s, b"OK old", 2.0)
     s.write(b"settle 1\n")
-    time.sleep(0.4)
-    s.read(512)
+    wait_bytes(s, b"OK settle", 2.0)
+    # Volts: the same ±15/16/17 V choice as the other ports, as this port's
+    # vsh1/vsl registers (it has no `volts` command). Never sent before, so
+    # the Volts buttons did nothing here. Firmware refuses anything above 0x4B/0x3A.
+    vsh1, vsl = VOLTS[knobs.volt_i].split()
+    s.write(("vsh1 0x%s\n" % vsh1).encode())
+    wait_bytes(s, b"OK vsh1", 2.0)
+    s.write(("vsl 0x%s\n" % vsl).encode())
+    wait_bytes(s, b"OK vsl", 2.0)
     s.write(("drive %d\n" % knobs.drive).encode())
     print("crow drive %d (GC + sweep)…" % knobs.drive)
     ok, raw = wait_bytes(s, b"OK drive", 20.0)
@@ -1667,6 +1754,16 @@ def leave_stream_crow(s):
         pass
     time.sleep(0.2)
     wait_bytes(s, b"STREAM done", 6.0)
+
+
+def crow_cmd(s, line, needle, timeout=10.0):
+    """One command at 115200 outside a stream. Returns (ok, reply text)."""
+    s.baudrate = 115200
+    s.reset_input_buffer()
+    s.write((line + "\n").encode())
+    s.flush()
+    ok, raw = wait_bytes(s, needle, timeout, to_nl=True)
+    return ok, raw.decode("utf-8", "replace")
 
 
 def encode_one(src, prev, prev_g, prev_bit, knobs, geo, tone_lut, thresh,
@@ -1847,36 +1944,58 @@ def xiao_stream_body(s, knobs, cam, ctl, poll=None):
     return why, sent, t0
 
 
-def run_crow_loop(s, knobs, cam, should_stop=None):
+def run_crow_loop(s, knobs, cam, should_stop=None, poll=None, ctl=None):
+    """Stream to the CrowPanel until something needs the port. Returns
+    (why, sent, t0); why is stop / quit / dead / rearm / white / hold / cmd.
+
+    `ctl` is the LiveStream (Ink Flow): its rearm, white, hold and queued
+    console commands end the loop the same way they end xiao_stream_body, and
+    the caller leaves the stream, acts, and re-enters. This loop used to watch
+    only console keys, so every one of those buttons did nothing on this panel
+    and the status line never left "opening source". `poll` is the console
+    key reader, for the command-line host only.
+    """
     import encode_video as crow_enc
     from play_video import send_chunked
 
-    lut = crow_enc.build_lut(knobs.gamma, knobs.contrast)
-    thresh = crow_enc.build_threshold(
-        crow_enc.PORTRAIT_H, crow_enc.PORTRAIT_W, "cluster8")
+    # Tone through the same LUT and threshold builders the xiao panels use, so
+    # gray levels (2 = plain threshold, 4/16/64 = cluster dither), bias, white,
+    # black and invert all reach this panel. It used crow_enc's own gamma/
+    # contrast LUT and a fixed cluster8 matrix, so the gray selector did nothing.
+    # Rebuilt whenever a knob changes, since the GUI edits them live.
+    tone_key = None
+    lut = thresh = None
     xmap = crow_enc.portrait_x_map()
     prev = np.full(crow_enc.PLANE_BYTES, 0xFF, dtype=np.uint8)
     sent = 0
     t0 = time.time()
     frozen = None
     enc_bytes = 0
+    win_t0, win_n = t0, 0
+    why = "stop"
     s.timeout = 0.05
     while True:
         if should_stop is not None and should_stop():
             break
-        act = poll_keys(knobs)
+        act = poll() if poll is not None else None
         if act == "quit":
+            why = "quit"
             break
         if act in ("rearm", "white"):
-            leave_stream_crow(s)
-            if not enter_stream_crow(s, knobs):
+            why = act
+            break
+        if ctl is not None:
+            if getattr(ctl, "_hold_color", None):
+                why = "hold"
                 break
-            prev = np.full(crow_enc.PLANE_BYTES, 0xFF, dtype=np.uint8)
-            sent = 0
-            t0 = time.time()
-            enc_bytes = 0
-            print(knobs.line())
-            continue
+            if getattr(ctl, "_white", False) or getattr(ctl, "_rearm", False):
+                why = "white" if ctl._white else "rearm"
+                ctl._white = ctl._rearm = False
+                break
+            if getattr(ctl, "_cmds", None):
+                why = "cmd"
+                break
+            ctl._tone = False   # tone is rebuilt from tone_key below
         if knobs.test:
             im = Image.new("L", (640, 360), 40)
             dr = ImageDraw.Draw(im)
@@ -1893,22 +2012,42 @@ def run_crow_loop(s, knobs, cam, should_stop=None):
             im = frozen
         else:
             frozen = None
-        fb = crow_enc.image_to_fb_rot(im, lut, thresh, xmap, 90)
+        # Framing first, into the canvas as it will be seen, then a passthrough
+        # rot=0 placement. Before this the crow path ignored fit, zoom, pad and
+        # mirror: image_to_fb_rot always fitted to width, so Fill == Fit.
+        if CROW_ROT:
+            im = im.rotate(CROW_ROT, expand=True)
+        im = Image.fromarray(compose_geo(im, knobs, CROW_CANVAS))
+        key = (knobs.gamma, knobs.contrast, knobs.white, knobs.black,
+               int(knobs.dither), knobs.bias, bool(knobs.invert))
+        if key != tone_key:
+            tone_key = key
+            lut = build_lut(knobs.gamma, knobs.contrast, knobs.white, knobs.black)
+            if knobs.invert:
+                lut = 255 - lut
+            thresh = build_threshold(knobs.dither, knobs.bias,
+                                     CROW_CANVAS.nh, CROW_CANVAS.nw)
+        fb = crow_enc.image_to_fb_rot(im, lut, thresh, xmap, 0)
         bmp, pay = crow_enc.wire_frame(fb, prev, keyframe=(sent % 60 == 0))
         if not send_chunked(s, bmp) or not send_chunked(s, pay):
-            print("\ndevice stopped asking")
+            why = "stop" if (should_stop is not None and should_stop()) else "dead"
             break
         prev = fb
         sent += 1
+        win_n += 1
         enc_bytes += len(bmp) + len(pay)
         now = time.time()
-        el = max(now - t0, 0.001)
-        if sent % 5 == 0:
-            avg = enc_bytes / max(sent, 1)
+        if ctl is not None and now - win_t0 >= 1.0:
+            ctl.fps = win_n / (now - win_t0)
+            win_t0, win_n = now, 0
+            ctl.status = ("streaming  %.1f fps  drive %d  dith %d  crow-579"
+                          % (ctl.fps, knobs.drive, int(knobs.dither)))
+        if sent % 5 == 0 and poll is not None:
+            el = max(now - t0, 0.001)
             print("\r%d f  %5.2f fps  drive %d  %s  " %
                   (sent, sent / el, knobs.drive, "crow-579"),
                   end="", flush=True)
-    return sent, t0
+    return why, sent, t0
 
 
 def handle_key(ch, knobs):
@@ -2113,7 +2252,18 @@ def main():
         try:
             if not enter_stream_crow(s, knobs):
                 sys.exit(1)
-            sent, t0 = run_crow_loop(s, knobs, cam)
+            while True:
+                why, sent, t0 = run_crow_loop(
+                    s, knobs, cam, poll=lambda: poll_keys(knobs))
+                if why not in ("rearm", "white"):
+                    if why == "dead":
+                        print("\ndevice stopped asking")
+                    break
+                # Stream entry seeds white, so White is a plain re-entry here.
+                leave_stream_crow(s)
+                if not enter_stream_crow(s, knobs):
+                    break
+                print(knobs.line())
         except KeyboardInterrupt:
             pass
         finally:
@@ -2358,14 +2508,18 @@ class LiveStream:
                 self._run_crow(knobs)
                 return
             self._run_xiao(knobs)
-        except Exception as e:
-            self.error = str(e)
-            self.status = str(e)
+        # SystemExit too: detect_panel() calls sys.exit on a forced-panel
+        # mismatch, and in this thread that ended the stream with no message.
+        except (Exception, SystemExit) as e:
+            self.error = str(e) or type(e).__name__
+            self.status = self.error
         finally:
             self.running = False
             if self.cam is not None:
                 self.cam.running = False
-            if not self.status or self.status == "opening source…":
+            st = self.status or ""
+            if (not st or st == "opening source…" or st.startswith("streaming")
+                    or st.startswith("entering") or st.startswith("re-entering")):
                 self.status = "stopped"
 
     def _run_xiao(self, knobs):
@@ -2403,6 +2557,9 @@ class LiveStream:
                         break
                     continue
                 if why == "hold":
+                    # The eraser: 8 deghost cycles at drive 12, then hold. That
+                    # many is what it takes to lift what the stream left on the
+                    # glass, which is the point of the button.
                     color = self._hold_color or "white"
                     self._hold_color = None
                     leave_stream(s)
@@ -2445,22 +2602,74 @@ class LiveStream:
                 pass
             s.close()
 
+    def _crow_hold(self, s, color):
+        """White out / Black out on the CrowPanel while streaming: the same
+        eraser as the XIAO panels, 8 deghost cycles at drive 12 (`flush 8`),
+        then hold. Runs on the open port; park_panel would reopen it."""
+        self.status = "holding %s (drive 12 full clear)…" % color
+        steps = (("drive 12", b"OK drive", 30.0), ("flush 8", b"OK flush", 90.0),
+                 (color, ("OK %s" % color).encode(), 30.0))
+        for line, needle, limit in steps:
+            ok, raw = crow_cmd(s, line, needle, limit)
+            for ln in raw.splitlines():
+                if ln.strip():
+                    self.conlog.append("  " + ln.rstrip())
+            if not ok:
+                self.status = "%s: no reply from the panel" % line
+                return
+        self.status = "paused, held %s" % color
+
     def _run_crow(self, knobs):
+        """Same button contract as _run_xiao: leave the stream, act, re-enter."""
         s = open_serial_crow(self.port)
+        in_stream = False
         try:
+            self.status = "entering stream…"
             if not enter_stream_crow(s, knobs):
                 self.error = "no STREAM ready (crow)"
                 self.status = self.error
                 return
-            sent, t0 = run_crow_loop(
-                s, knobs, self.cam, should_stop=lambda: not self.running)
-            el = max(time.time() - t0, 0.001)
-            self.fps = sent / el
-        finally:
-            try:
+            in_stream = True
+            self.status = "streaming"
+            while self.running:
+                why, sent, t0 = run_crow_loop(
+                    s, knobs, self.cam, should_stop=lambda: not self.running,
+                    ctl=self)
+                if why in ("dead", "stop", "quit"):
+                    if why == "dead":
+                        self.status = "device stopped asking"
+                    break
                 leave_stream_crow(s)
-            except Exception:
-                pass
+                in_stream = False
+                if why == "cmd":
+                    self._run_cmds(s)
+                elif why == "hold":
+                    color = self._hold_color or "white"
+                    self._hold_color = None
+                    self._crow_hold(s, color)
+                    while self.running and knobs.paused:
+                        nxt = self._hold_color
+                        if nxt:
+                            self._hold_color = None
+                            self._crow_hold(s, nxt)
+                        time.sleep(0.05)
+                    if not self.running:
+                        break
+                # rearm and white: re-entry alone does it. Entry re-sends volts
+                # and drive, and stream_run seeds the panel white.
+                self.status = "re-entering stream…"
+                if not enter_stream_crow(s, knobs):
+                    self.error = "re-enter failed (crow)"
+                    self.status = self.error
+                    break
+                in_stream = True
+                self.status = "streaming"
+        finally:
+            if in_stream:
+                try:
+                    leave_stream_crow(s)
+                except Exception:
+                    pass
             s.close()
 
 

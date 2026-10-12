@@ -2317,15 +2317,18 @@ static void print_modes(void) {
 static void print_status(void) {
   const ModeInfo &m = mode_info();
   Serial.printf(
-      "STATUS mode=%u/%u %s seq=0x%02X old=%u run=%u frame=%lu radius=%d "
+      // panel= is what Ink Flow reads to pick this port's stream path; without
+      // it the host fell back to guessing from the USB id.
+      "STATUS panel=crow-579 mode=%u/%u %s seq=0x%02X old=%u run=%u frame=%lu radius=%d "
       "speed=%d clean_every=%u clean_passes=%u spi=%s last_busy_ms=%lu "
-      "avg_busy_ms=%lu\n",
+      "avg_busy_ms=%lu drive=%u fr=0x%02X\n",
       (unsigned)(g_mode + 1), (unsigned)kModeCount, m.name, (unsigned)m.seq22,
       (unsigned)m.old_plane, (unsigned)g_running, (unsigned long)g_frame, g_radius,
       g_speed, (unsigned)g_clean_every, (unsigned)g_clean_passes,
       EPD_SpiPathName(), (unsigned long)(g_last_busy_us / 1000UL),
       (unsigned long)(g_mode_frames ? (g_mode_busy_sum / g_mode_frames / 1000ULL)
-                                    : 0ULL));
+                                    : 0ULL),
+      (unsigned)g_wp.drive_tp, (unsigned)g_wp.fr);
 }
 
 // ---- USB video streaming ----------------------------------------------------
@@ -2380,7 +2383,13 @@ static volatile uint32_t g_srx_frames = 0;
 // Bulk Serial.read(buf, n), NEVER Serial.readBytes(): the latter is
 // Stream::readBytes, which calls read() once per byte and so performs one queue
 // operation per byte — 27200 of them for a worst-case frame.
-static bool stream_read_exact(uint8_t *dst, uint32_t total) {
+// `cancelable`: the host ends a stream with a lone CAN (0x18) where the next
+// frame's bitmap would start. A bitmap byte can legitimately be 0x18, so CAN only
+// counts when it is the ONLY byte of a frame and nothing follows it for 200 ms;
+// a real 3400-byte bitmap goes out in one host write and never pauses that long
+// after its first byte. Without this the stream ended only on the 4 s timeout, so
+// Stop on the host took ~4.5 s.
+static bool stream_read_exact(uint8_t *dst, uint32_t total, bool cancelable = false) {
   uint32_t off = 0;
   while (off < total) {
     uint32_t want = total - off;
@@ -2404,6 +2413,9 @@ static bool stream_read_exact(uint8_t *dst, uint32_t total) {
           Serial.write((uint8_t)0x06);
           reack = millis();
         }
+        if (cancelable && off == 0 && have == 1 && dst[0] == 0x18 &&
+            (millis() - tw) > 200)
+          return false;
         // delay(1), not delay(0): vTaskDelay(0) yields only to tasks of equal or
         // higher priority, so this task would starve its core's IDLE task and the
         // watchdog would panic the board.
@@ -2433,7 +2445,7 @@ static void stream_rx_task(void *) {
   while (g_srx_run) {
     if (xSemaphoreTake(g_sem_free, pdMS_TO_TICKS(200)) != pdTRUE) continue;
     StreamSlot *s = &g_sslot[cur];
-    if (!stream_read_exact(s->bmp, STREAM_BMP_BYTES)) break;
+    if (!stream_read_exact(s->bmp, STREAM_BMP_BYTES, true)) break;
     s->paylen = popcount_bytes(s->bmp, STREAM_BMP_BYTES);
     if (s->paylen > PLANE_BYTES) break;
     if (!stream_read_exact(s->pay, s->paylen + 1)) break;  // payload + checksum
@@ -2482,23 +2494,36 @@ static void stream_apply(const StreamSlot *s) {
   }
 }
 
-// Composite what the panel shows: clean video, then a compact overlay. ImageBW is
-// scratch as far as the delta chain is concerned.
-// Cached HUD strip.
+// Composite what the panel shows: clean video, then the HUD. ImageBW is scratch
+// as far as the delta chain is concerned.
 //
-// The overlay lives in portrait y 36..148, and portrait y maps to native X as
-// 799 - y, so it occupies native byte columns ~81..95. The framebuffer is
-// column-major, so those columns are ONE CONTIGUOUS RUN — which makes the whole
-// overlay a single memcpy instead of ~40000 Paint_SetPixel calls per frame (a
-// switch, a seam test and a read-modify-write each). Re-rasterised only when the
-// text actually changes, i.e. once a second.
-#define SHUD_C0 80
-#define SHUD_C1 96
-#define SHUD_OFF ((uint32_t)SHUD_C0 * Gate_BITS)
-#define SHUD_BYTES ((uint32_t)(SHUD_C1 - SHUD_C0 + 1) * Gate_BITS)
-static uint8_t g_shud[SHUD_BYTES];
+// Two tags on the top edge of the portrait canvas: MODE at the left, fps at the
+// right, size 24, each on its own tight white box (hud_text's pad) so the video
+// never runs through the glyphs. Only the two boxes are pasted over the video;
+// everything between and below them stays picture. (Was two lines at size 48,
+// stacked top-left in a whole-width strip: it sat in the letterbox band when the
+// video was fitted to width, and covered the picture once Fill reached the top.)
+//
+// Rasterised into g_hud_fb only when the text changes, about once a second. Per
+// frame the boxes are copied back column by column: portrait y maps to native X
+// as 799 - y, and the buffer is column-major, so a box is one short memcpy per
+// 8-px byte column. Its y extent therefore snaps out to whole byte columns;
+// those extra rows are white in g_hud_fb, so the box grows by at most 7 px.
+#define HUD_SIZE 24
+#define HUD_EDGE 6            // gap between a box and the panel edge
+static uint8_t g_hud_fb[(uint32_t)EPD_H * FB_WBYTES];
 static char g_shud_txt[24] = "";
 static bool g_shud_valid = false;
+typedef struct { int x0, y0, x1, y1; } HudBox;   // portrait, inclusive
+static HudBox g_hud_box[2];
+
+static void hud_box_paste(const HudBox &b) {
+  // Portrait y < 396 everywhere here, so no cascade-seam offset applies.
+  int c0 = (EPD_W - 1 - b.y1) / 8, c1 = (EPD_W - 1 - b.y0) / 8;
+  int r0 = b.x0 < 0 ? 0 : b.x0, r1 = b.x1 > Gate_BITS - 1 ? Gate_BITS - 1 : b.x1;
+  for (int c = c0; c <= c1; c++)
+    memcpy(ImageBW + FB_IDX(r0, c), g_hud_fb + FB_IDX(r0, c), (size_t)(r1 - r0 + 1));
+}
 
 static void stream_compose(void) {
   memcpy(ImageBW, g_vid, sizeof(ImageBW));
@@ -2506,29 +2531,27 @@ static void stream_compose(void) {
   char want[24];
   snprintf(want, sizeof(want), "%u|%s", (unsigned)g_wp.drive_tp,
            g_fps_num[0] ? g_fps_num : "--");
-  if (g_shud_valid && !strcmp(want, g_shud_txt)) {
-    memcpy(ImageBW + SHUD_OFF, g_shud, SHUD_BYTES);
-    return;
+  if (!g_shud_valid || strcmp(want, g_shud_txt)) {
+    memcpy(g_shud_txt, want, sizeof(g_shud_txt));
+    g_shud_valid = true;
+    memset(g_hud_fb, 0xFF, sizeof(g_hud_fb));
+    paint_bind(g_hud_fb);
+    const int y = HUD_EDGE + HUD_PAD;
+    char line[16];
+    snprintf(line, sizeof(line), "MODE %u", (unsigned)g_wp.drive_tp);
+    int w = (int)strlen(line) * (HUD_SIZE / 2);
+    int x = HUD_EDGE + HUD_PAD;
+    hud_text(x, y, line, HUD_SIZE);
+    g_hud_box[0] = {x - HUD_PAD, y - HUD_PAD, x + w + HUD_PAD, y + HUD_SIZE + HUD_PAD};
+    snprintf(line, sizeof(line), "%s fps", g_fps_num[0] ? g_fps_num : "--");
+    w = (int)strlen(line) * (HUD_SIZE / 2);
+    x = PW - HUD_EDGE - HUD_PAD - w;
+    hud_text(x, y, line, HUD_SIZE);
+    g_hud_box[1] = {x - HUD_PAD, y - HUD_PAD, x + w + HUD_PAD, y + HUD_SIZE + HUD_PAD};
+    paint_bind(ImageBW);
   }
-  memcpy(g_shud_txt, want, sizeof(g_shud_txt));
-  g_shud_valid = true;
-  paint_bind(ImageBW);
-  // Size 48, the largest the font blob carries (12/16/24/48 only), and placed at
-  // y=50 so it lands inside the letterbox band above a rotated video rather than on
-  // top of the picture. Glyph advance is size/2, so 7 chars is 168 px of the 272
-  // available. At 24 it was unreadable from a normal viewing distance.
-  // Two lines rather than one: at size 48 the advance is 24 px per glyph, so
-  // "MODE 4" plus "15.2 fps" on one line would be 15 chars = 360 px against the 272
-  // available. Split, both still inside the letterbox band (y 0..153) above a
-  // rotated video.
-  char line[16];
-  snprintf(line, sizeof(line), "MODE %u", (unsigned)g_wp.drive_tp);
-  hud_text(12, 40, line, 48);
-  snprintf(line, sizeof(line), "%s fps", g_fps_num[0] ? g_fps_num : "--");
-  hud_text(12, 96, line, 48);
-  // Snapshot the strip for the frames in between. The video is letterboxed white in
-  // these columns, so nothing of the picture is baked into the cache.
-  memcpy(g_shud, ImageBW + SHUD_OFF, SHUD_BYTES);
+  hud_box_paste(g_hud_box[0]);
+  hud_box_paste(g_hud_box[1]);
 }
 
 // `stream` — play until the host stops sending. Raises the baud for the duration
@@ -2563,7 +2586,7 @@ static void stream_run(void) {
   memset(g_vid, 0xFF, sizeof(g_vid));  // the host's first delta is against white
   g_shud_valid = false;                // force one rasterise at the start of a stream
 
-  Serial.printf("STREAM ready baud=%lu bmp=%u plane=%lu drive=%u\n",
+  Serial.printf("STREAM ready baud=%lu bmp=%u plane=%lu drive=%u panel=crow-579\n",
                 (unsigned long)STREAM_BAUD, (unsigned)STREAM_BMP_BYTES,
                 (unsigned long)PLANE_BYTES, (unsigned)g_wp.drive_tp);
   Serial.flush();
@@ -2579,7 +2602,8 @@ static void stream_run(void) {
   uint8_t cur = 0;
   uint32_t t0 = millis(), shown = 0;
   while (true) {
-    if (xSemaphoreTake(g_sem_ready, pdMS_TO_TICKS(1500)) != pdTRUE) {
+    // Short wait: it only bounds how late an ended RX task is noticed.
+    if (xSemaphoreTake(g_sem_ready, pdMS_TO_TICKS(50)) != pdTRUE) {
       if (g_srx_done) break;
       continue;
     }
@@ -2657,6 +2681,7 @@ static void print_help(void) {
   Serial.println("  run | stop | step");
   Serial.println("  seed        re-sync NEW/OLD planes to current image");
   Serial.println("  clear       one GC full clear (only intentional flash)");
+  Serial.println("  white|black stop the bench, hold the panel at one level (no flash)");
   Serial.println("  speed N     % of one shape-length per frame (10..400; 100 = no overlap)");
   Serial.println("  box N       Ms Pac-Man box in px (12..120) — sets the step too");
   Serial.println("  radius N    same dial in radius units (6..60)");
@@ -2756,6 +2781,21 @@ static void handle_cmd(char *s) {
     epd_seed();
     apply_mode_wave();
     Serial.println("OK clear");
+    return;
+  }
+  // `white` / `black` — stop the bench and hold the whole panel at one level.
+  // Ink Flow's White out / Black out and Park send these. One seed: OLD is
+  // written inverted so every pixel takes a real transition, then OLD = NEW so
+  // the planes agree with the glass. No GC flash. Rails go down afterwards,
+  // as `stop` does, because energised rails must not be the idle state.
+  if (!strcmp(s, "white") || !strcmp(s, "black")) {
+    const bool white = (s[0] == 'w');
+    g_running = false;
+    memset(ImageBW, white ? 0xFF : 0x00, sizeof(ImageBW));
+    epd_seed();
+    apply_mode_wave();  // the seed runs the vendor path and drops the custom LUT
+    if (EPD_AnalogIsOn()) analog_power(false);
+    Serial.println(white ? "OK white" : "OK black");
     return;
   }
   if (!strncmp(s, "result ", 7)) {
@@ -3276,6 +3316,11 @@ static void poll_serial(void) {
       g_ser_len = 0;
       continue;
     }
+    // Drop control bytes. The host sends a lone CAN (0x18) on every connect to
+    // end any stream still running; outside a stream it landed at the front of
+    // the next line, so the first `status` read as "\x18status", came back ERR
+    // unknown, and Connect only worked on its retry.
+    if ((uint8_t)c < 0x20) continue;
     if (g_ser_len < sizeof(g_ser_line) - 1) g_ser_line[g_ser_len++] = c;
   }
 }

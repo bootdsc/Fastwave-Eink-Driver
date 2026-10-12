@@ -170,7 +170,11 @@ def image_to_fb_rot(im, lut, thresh, xmap, rot):
     """
     if im.mode != "L":
         im = im.convert("L")
-    im = im.transpose(Image.ROTATE_90 if rot == 90 else Image.ROTATE_270)
+    # The canvas reaches the glass turned 90 clockwise (xmap), so rot=90 cancels
+    # that and rot=0 leaves the picture turned 90 clockwise on the glass.
+    turn = {90: Image.ROTATE_90, 180: Image.ROTATE_180, 270: Image.ROTATE_270}
+    if rot in turn:
+        im = im.transpose(turn[rot])
     sw, sh = im.size
 
     nh = max(1, round(sh * PORTRAIT_W / sw))
