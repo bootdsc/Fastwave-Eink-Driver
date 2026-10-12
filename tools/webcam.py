@@ -147,20 +147,31 @@ _FPS_FONT = None
 
 def fps_font(size=72):
     global _FPS_FONT
-    if _FPS_FONT is not None and _FPS_FONT.size == size:
+    if _FPS_FONT is not None and getattr(_FPS_FONT, "size", None) == size:
         return _FPS_FONT
+    # Windows paths first, then names Pillow finds in the system font folders
+    # on Linux and macOS. Without these the badge fell back to a tiny bitmap
+    # font off Windows.
     for path in (
         r"C:\Windows\Fonts\arialbd.ttf",
         r"C:\Windows\Fonts\arial.ttf",
         r"C:\Windows\Fonts\consolab.ttf",
-        r"C:\Windows\Fonts\consola.ttf",
+        "DejaVuSans-Bold.ttf",
+        "LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial Bold.ttf",
     ):
         try:
             _FPS_FONT = ImageFont.truetype(path, size)
             return _FPS_FONT
         except OSError:
             continue
-    _FPS_FONT = ImageFont.load_default()
+    try:
+        _FPS_FONT = ImageFont.load_default(size=size)   # Pillow 10.1+
+    except TypeError:
+        _FPS_FONT = ImageFont.load_default()
     return _FPS_FONT
 
 
@@ -671,7 +682,7 @@ def _try_camera(index):
     # Do not force 1280x720: the laptop cam often fails the first grab if
     # you set size before it has delivered a frame.
     backends = []
-    if hasattr(cv2, "CAP_DSHOW"):
+    if sys.platform == "win32" and hasattr(cv2, "CAP_DSHOW"):
         backends.append(cv2.CAP_DSHOW)
     backends.append(cv2.CAP_ANY)
     for attempt in range(3):
@@ -730,10 +741,26 @@ def make_dpi_aware():
             pass
 
 
+_SCREEN = None
+
+
 def virtual_screen():
-    u = ctypes.windll.user32
-    return (int(u.GetSystemMetrics(76)), int(u.GetSystemMetrics(77)),
-            int(u.GetSystemMetrics(78)), int(u.GetSystemMetrics(79)))
+    """(x, y, w, h) of the whole desktop, every monitor included.
+
+    Windows asks the OS. Elsewhere the region picker caches Tk's screen size
+    here; without it (a --region given on the command line) one full grab
+    gives the size. Linux needs an X11 display Pillow can reach (Wayland
+    sessions need XWayland for the Screen source).
+    """
+    global _SCREEN
+    if sys.platform == "win32":
+        u = ctypes.windll.user32
+        return (int(u.GetSystemMetrics(76)), int(u.GetSystemMetrics(77)),
+                int(u.GetSystemMetrics(78)), int(u.GetSystemMetrics(79)))
+    if _SCREEN is None:
+        w, h = ImageGrab.grab().size
+        _SCREEN = (0, 0, int(w), int(h))
+    return _SCREEN
 
 
 def parse_region(text):
@@ -791,6 +818,16 @@ def pick_screen_region(parent=None):
         win = tk.Toplevel(parent)
         win.transient(parent)
     win.overrideredirect(True)
+    # Off Windows the desktop is measured in Tk's own units. They match what
+    # ImageGrab takes as a box on both systems: pixels on Linux/X11, points on
+    # macOS (Pillow resizes a Retina grab to the box). Cached for clamp_bbox.
+    global _SCREEN
+    if sys.platform != "win32":
+        sw, sh = int(win.winfo_screenwidth()), int(win.winfo_screenheight())
+        if sw > 0 and sh > 0:
+            _SCREEN = (0, 0, sw, sh)
+            vx, vy, vw, vh = _SCREEN
+    gw, gh = vw, vh
     win.geometry("%dx%d+%d+%d" % (vw, vh, vx, vy))
     try:
         win.attributes("-topmost", True)
@@ -798,7 +835,7 @@ def pick_screen_region(parent=None):
         pass
     win.configure(bg="#101010")
 
-    cv = tk.Canvas(win, width=vw, height=vh, highlightthickness=0,
+    cv = tk.Canvas(win, width=gw, height=gh, highlightthickness=0,
                    bg="#101010", cursor="cross")
     cv.pack(fill="both", expand=True)
 
@@ -809,6 +846,8 @@ def pick_screen_region(parent=None):
         shot = ImageGrab.grab(bbox=(vx, vy, vx + vw, vy + vh), all_screens=True)
         if shot.mode != "RGB":
             shot = shot.convert("RGB")
+        if shot.size != (gw, gh):
+            shot = shot.resize((gw, gh), Image.BILINEAR)
         dim = (np.asarray(shot, dtype=np.uint16) * 38 // 100).astype(np.uint8)
         photo = ImageTk.PhotoImage(Image.fromarray(dim, "RGB"))
         win._photo = photo
@@ -817,9 +856,9 @@ def pick_screen_region(parent=None):
         pass
 
     cv.create_text(
-        vw // 2, 28, fill="#f2f2f2", font=("Segoe UI", 16, "bold"),
+        gw // 2, 28, fill="#f2f2f2", font=("Segoe UI", 16, "bold"),
         text="Drag a rectangle  ·  release to capture  ·  F = full desktop  ·  Esc = cancel")
-    hint = cv.create_text(vw // 2, 56, fill="#dddd00", font=("Consolas", 14),
+    hint = cv.create_text(gw // 2, 56, fill="#dddd00", font=("Consolas", 14),
                           text="")
     rect = cv.create_rectangle(0, 0, 0, 0, outline="#ffee00", width=2)
     drag = {"x0": 0, "y0": 0, "on": False}

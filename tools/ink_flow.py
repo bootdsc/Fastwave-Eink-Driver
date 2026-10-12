@@ -260,8 +260,6 @@ class App(tk.Tk):
             state="readonly",
         )
         self.cam_box.pack(side="left", padx=6)
-        ttk.Label(r, text="0 desk · 1 laptop · 2 glass (do not stream 2)",
-                  foreground=GRAY).pack(side="left")
 
         r = ttk.Frame(srcf)
         r.pack(fill="x", pady=4)
@@ -401,9 +399,6 @@ class App(tk.Tk):
         for deg in (0, 90, 180, 270):
             ttk.Radiobutton(rr, text="%d°" % deg, variable=self.rotv, value=deg,
                             command=self._rotate).pack(side="left", padx=8)
-        ttk.Label(rr, text="clockwise from the panel's normal view. "
-                           "90 / 270 play video sideways for a panel held the other way.",
-                  foreground=GRAY).pack(side="left", padx=8)
 
         tf = self._section(pad, "Tone / gray (live)", "tone")
         dr = ttk.Frame(tf)
@@ -624,7 +619,12 @@ class App(tk.Tk):
             self._con_n = len(log)
 
     def _refresh_eq_labels(self) -> None:
+        # On Auto, use the panel the board named once it has been connected.
+        # Auto alone priced every drive at the 1.54"'s 2132 ms, so a 5.79"
+        # read "~141 drives" for a run that logged ~893.
         panel = self.panel_key()
+        if panel == "auto" and self._connected and self._connected[1]:
+            panel = self._connected[1]
         cur = int(self.eq_min.get() or 15)
         if cur not in wv.EQUALIZE_MINS:
             cur = 15
@@ -713,11 +713,13 @@ class App(tk.Tk):
         label = next((lb for k, lb in PANELS if k == panel), panel)
         self.conn.set("connected  %s  %s  (%s)" % (port, label, how))
         self.conn_btn.configure(text="Disconnect")
+        self._refresh_eq_labels()
 
     def _set_disconnected(self, why) -> None:
         self._connected = None
         self.conn.set(why)
         self.conn_btn.configure(text="Connect")
+        self._refresh_eq_labels()
 
     def _port_changed(self, *_a) -> None:
         if self._connected and self._connected[0] != self.port.get().strip():
@@ -1038,8 +1040,11 @@ class App(tk.Tk):
                 self._pause_buttons()
             elif st.running:
                 if not self._connected:
+                    # The stream knows the real panel once it has detected it;
+                    # the selector may still say Auto.
                     self._set_connected(self.port.get().strip(),
-                                        self.panel_key(), "streaming")
+                                        getattr(st.knobs, "panel", None)
+                                        or self.panel_key(), "streaming")
                 self.status.set(st.status or "streaming")
                 pos, n = st.position()
                 fps = st.cam.src_fps if st.cam else 0.0
