@@ -27,7 +27,7 @@ from PIL import Image
 
 import play
 from play import (CHUNK, PLANE, H, STRIDE, W, apply_tone, build_threshold,
-                  encode_delta, fit_image, park_rim, send_blob)
+                  encode_delta, fit_image, park_rim, send_frame)
 
 try:
     import mss
@@ -156,7 +156,7 @@ def main():
             cur = np.packbits(g > thresh, axis=1)
             park_rim(cur)
             bmp, lit = encode_delta(cur, prev)
-            if not send_blob(s, bmp) or not send_blob(s, lit):
+            if not send_frame(s, bmp, lit):
                 print("\ndevice stopped asking for data")
                 break
             prev = cur

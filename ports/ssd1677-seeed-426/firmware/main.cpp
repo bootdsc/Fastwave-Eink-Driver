@@ -24,6 +24,7 @@
 #include "spi.h"
 #include "ssd1677.h"
 #include "wave1677.h"
+#include "stream_wire.h"
 
 // ---- framebuffers -----------------------------------------------------------
 // 48000 bytes each. Internal RAM: the XIAO S3 has 512 KB, and these are read
@@ -170,24 +171,14 @@ static bool stream_read_exact(uint8_t *dst, uint32_t total)
 // Rebuild a frame into `dst` from `base` plus the delta on the wire. `base` is
 // the other ping-pong buffer — the consumer only ever reads it, so taking it as
 // the reconstruction source needs no extra 48 KB and no extra synchronisation.
+// wire=2, via the shared reader in stream_wire.h. Was a bespoke wire=1 pair of
+// full-length reads with an ACK per 12288-byte chunk; the host defaults to
+// wire=2 and would have desynchronised on the 3-byte header. One ACK per frame
+// now, and the occupancy bitmap arrives RLE'd when that is smaller — which for
+// a 6000-byte bitmap over a mostly-static frame it usually is.
 static bool stream_recv(uint8_t *dst, const uint8_t *base)
 {
-  if (!stream_read_exact(g_bmp, sizeof(g_bmp))) return false;
-
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < sizeof(g_bmp); i++) n += __builtin_popcount(g_bmp[i]);
-  if (n && !stream_read_exact(g_lit, n)) return false;
-
-  memcpy(dst, base, EPD_PLANE_BYTES);
-  uint32_t k = 0;
-  for (uint32_t i = 0; i < sizeof(g_bmp); i++) {
-    uint8_t m = g_bmp[i];
-    if (!m) continue;  // the common case: skip eight untouched bytes at once
-    uint32_t at = i * 8;
-    for (uint8_t b = 0; b < 8; b++)
-      if (m & (0x80 >> b)) dst[at + b] = g_lit[k++];
-  }
-  return true;
+  return stream_recv_wire2(dst, base, g_bmp, g_lit);
 }
 
 static void stream_rx_task(void *arg)
@@ -1011,6 +1002,47 @@ static void panel_clear_white(void)
   Serial.printf("CLEAR busy_ms=%lu\n", (unsigned long)(b / 1000UL));
 }
 
+// Drive the whole panel to one level with EVERY pixel taking a real
+// transition, using the verified 0xD7 full-refresh sequence.
+//
+// panel_clear_white() cannot do this. It writes NEW=white and bypasses OLD to
+// 0, so the controller drives one black->white pass and calls it done. One
+// pass does not lift an image that has been driven into the film -- the bench
+// card sat through a `run` at +/-17 V -- so it survived every reboot and looked
+// for all the world like firmware still drawing it.
+//
+// It was BOTH, and reading it as retention alone is what kept this bug alive.
+// setup() has not rendered the card for a long time, so a reboot really does
+// come up clean; the `drive N` handler was still calling render() on every
+// host command, which put it straight back. Retention only explained why
+// clearing the glass by hand never seemed to stick.
+static void panel_full_to(uint8_t v)
+{
+  fb_fill(v);
+  EPD_SetRamOption(RAM_NORMAL, RAM_NORMAL);
+  EPD_WriteNew(g_fb);
+  EPD_WriteOld(g_fb, true);  // inverted OLD: every pixel is a transition
+  uint32_t b = 0;
+  EPD_Update(0xD7, &b);
+  EPD_WriteOld(g_fb, false);
+  memcpy(g_prev, g_fb, sizeof(g_prev));
+  Serial.printf("FULL %s busy_ms=%lu\n", v == WHITE ? "white" : "black",
+                (unsigned long)(b / 1000UL));
+}
+
+// Black, then white. The standard cure for retained ink, and the only thing
+// that reliably clears a card that has been sitting on the glass. Costs about
+// a second, at power-on only -- nothing in the stream path flashes.
+// `deghost N` runs N more pairs by hand for something properly set in.
+static void panel_deghost(uint8_t pairs)
+{
+  if (!pairs) pairs = 1;
+  for (uint8_t i = 0; i < pairs; i++) {
+    panel_full_to(BLACK);
+    panel_full_to(WHITE);
+  }
+}
+
 // Seed: drive the current framebuffer onto the glass and leave both planes
 // agreeing with it, so the next differential update starts coherent.
 static void panel_seed(void)
@@ -1051,7 +1083,9 @@ static void show_frame(void)
   // host drains it, so logging per frame ties the animation to whether anything
   // is listening — with no terminal attached the panel dropped from ~6 fps to
   // ~1 fps, which looks exactly like a display problem and is not one.
-  // setTxTimeoutMs(0) in setup() stops the blocking; this keeps the noise down.
+  // setTxTimeoutMs is 20 ms in setup(), not 0 — see there. So an undrained
+  // FIFO costs at most 20 ms once every 8 frames instead of stalling; the
+  // throttle is what keeps that off the frame rate.
   //
   // The 5.79 sibling has the same throttle at 32, because it logs over a 115200
   // UART where the line costs ~14.8 ms of wire time rather than a USB bulk write.
@@ -1167,9 +1201,10 @@ static void print_help(void)
 
 static void print_status(void)
 {
-  Serial.printf("STATUS %ux%u custom=%u seq=0x%02X drive=%u settle=%u rp=%u fr=0x%02X "
+  Serial.printf("STATUS panel=xiao-426 %ux%u wire=%u custom=%u seq=0x%02X drive=%u settle=%u rp=%u fr=0x%02X "
                 "pol=%u spi=%s frames=%u fr_period_us=%lu run=%u frame=%lu\n",
-                EPD_W, EPD_H, (unsigned)g_custom, (unsigned)eff_seq(),
+                EPD_W, EPD_H, (unsigned)STREAM_WIRE, (unsigned)g_custom,
+                (unsigned)eff_seq(),
                 (unsigned)g_wp.drive_tp, (unsigned)g_wp.settle_tp, (unsigned)g_wp.rp,
                 (unsigned)g_wp.fr, (unsigned)g_wp.invert, EPD_SpiPathName(),
                 (unsigned)wave1677_frames(g_lut), (unsigned long)g_fr_period_us,
@@ -1255,7 +1290,11 @@ static void handle_cmd(char *s)
     // It was 'R', and the banner "STREAM ready" contains an R — the host saw
     // that, started sending immediately, and the stream desynchronised before it
     // began. 0x06 (ACK) is never printed.
-    Serial.println("STREAM ready");
+    // The host reads wire= and panel= off THIS line. panel= is the guard
+    // against aiming a 48000-byte plane at a 5000-byte controller.
+    stream_wire_reset();
+    Serial.printf("STREAM ready wire=%u panel=xiao-426 %ux%u seq=0x%02X\n",
+                  (unsigned)STREAM_WIRE, EPD_W, EPD_H, (unsigned)eff_seq());
     Serial.flush();
     delay(50);
 
@@ -1700,8 +1739,22 @@ static void handle_cmd(char *s)
     tetris_run(s[6] ? atoi(s + 7) : 5);
     return;
   }
+  // The shared host sends `trail` and `chase` at stream entry for every panel.
+  // There is no trail machinery on this port, so say so and answer at once —
+  // silence cost two 2 s host timeouts on every stream start.
+  if (!strncmp(s, "trail", 5)) {
+    Serial.println("OK trail=0 - not implemented on this port");
+    return;
+  }
+  if (!strncmp(s, "chase", 5)) {
+    Serial.println("OK chase=0 - not implemented on this port");
+    return;
+  }
   if (!strcmp(s, "seqscan")) { run_seqscan(); return; }
   if (!strcmp(s, "clear")) { panel_clear_white(); return; }
+  // `deghost N` is handled further down. A second handler here, added with
+  // panel_deghost(), sat first and answered "OK deghost" — Ink Flow's Park and
+  // equalizer wait for "DEGHOST done" and would have timed out on every run.
 
   // Static black bar, drawn with a FULL Mode 1 refresh so it is at maximum
   // quality and does not move — for inspecting individual gate lines. Walk it
@@ -1874,7 +1927,15 @@ static void handle_cmd(char *s)
       g_wp.drive_tp = (uint8_t)v;
       arm_wave();
       panel_clear_white();
-      render();
+      // No render() here. It used to draw the bench card -- three numbers at
+      // the top-left and the bouncing disc -- and panel_seed() below then
+      // drove that onto the glass with an inverted OLD plane and set g_prev
+      // to it. Every host command that sets the mode paints it: `enter_stream`
+      // sends `drive N` on entry AND on every rearm, and the rearm path passes
+      // do_white=False, so the card stayed on the glass and the video diffed
+      // itself out of it over several frames. Seeding white is what the stream
+      // path wants; `run` draws the card from loop() when it is asked for.
+      fb_fill(WHITE);
       panel_seed();
     }
     Serial.printf("OK drive=%u (cleared + reseeded)\n", (unsigned)g_wp.drive_tp);
@@ -1948,7 +2009,10 @@ void setup(void)
 #if ARDUINO_USB_CDC_ON_BOOT
   // Never block the render loop on USB. Without this, a write with no host
   // reading stalls until the CDC timeout expires, once per frame.
-  Serial.setTxTimeoutMs(0);
+  // NOT 0. At 0 a full TX FIFO drops bytes silently rather than blocking,
+  // which truncated the STREAM ready banner mid-word on the 1.54" and cost
+  // the host its wire= and panel= fields.
+  Serial.setTxTimeoutMs(20);
 #endif
   delay(200);
 
@@ -1997,10 +2061,17 @@ void setup(void)
 
   EPD_InitFast();
   Serial.println("init done, clearing...");
-  panel_clear_white();
+  panel_deghost(1);
 
-  render();
-  panel_seed();
+  // Boot leaves the glass WHITE and both planes agreeing with it. It used to
+  // render the bench card here — a circle and a digit plate — which is junk the
+  // moment the panel is used for anything else. `stream` sends deltas against
+  // an assumed-white base, so the card had to be driven off by the video
+  // itself, taking several frames of a short waveform to fade rather than
+  // clearing at once. `run` still starts the bench animation on request.
+  //
+  // panel_clear_white() has already left g_prev == g_fb == WHITE, so nothing
+  // else is needed to make the first differential update coherent.
 
   // Start on the fast custom waveform. This board has no buttons, so anything
   // that needs a serial command to come alive just looks broken on the bench.

@@ -269,6 +269,42 @@ def send_blob(s, blob):
     return True
 
 
+def pack_wire2(bmp, lit):
+    """Wire 2, as the firmware's stream_wire.h reads it: u8 flags (bit0 = RLE),
+    u16 n_lit little-endian, occupancy (RLE when shorter), then the literals.
+    RLE: 0x00 + count(1..255) is a zero run, any other byte is literal."""
+    rle = bytearray()
+    i, n = 0, len(bmp)
+    while i < n:
+        if bmp[i] == 0:
+            z = 1
+            i += 1
+            while i < n and bmp[i] == 0 and z < 255:
+                z += 1
+                i += 1
+            rle += bytes((0, z))
+        else:
+            rle.append(bmp[i])
+            i += 1
+    flags, occ = (1, bytes(rle)) if len(rle) < len(bmp) else (0, bmp)
+    k = len(lit)
+    return bytes((flags, k & 255, (k >> 8) & 255)) + occ + lit
+
+
+def send_frame(s, bmp, lit):
+    """One ACK per frame, then the whole wire-2 frame. The firmware moved from
+    wire 1 (an ACK per 12288-byte chunk, bitmap and literals sent separately)
+    to the shared wire 2 reader; send_blob is left for the --gray planes."""
+    if not wait_token(s):
+        return False
+    try:
+        s.write(pack_wire2(bmp, lit))
+    except serial.SerialTimeoutException:
+        print("\nwrite timed out - device stopped reading")
+        return False
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("port")
@@ -452,7 +488,7 @@ def main():
                     # cannot keep up, the deficit must not accumulate into a
                     # burst of catch-up frames once it does.
                     due = max(due + frame_dt, time.time())
-                if not send_blob(s, bmp) or not send_blob(s, lit):
+                if not send_frame(s, bmp, lit):
                     print("\ndevice stopped asking for data")
                     return
                 prev = cur
