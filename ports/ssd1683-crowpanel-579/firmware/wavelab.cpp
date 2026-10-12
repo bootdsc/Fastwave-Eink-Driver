@@ -2434,6 +2434,75 @@ static uint32_t popcount_bytes(const uint8_t *p, uint32_t n) {
   return c;
 }
 
+// `stream2`: the same frame, with the 3400-byte change map RLE-compressed when
+// that is shorter. Over the CH340's ~200 kB/s the raw map alone was 17 ms of
+// wire every frame, and a mostly static frame's map is mostly zeros; on Big
+// Buck Bunny it cut the median frame from 5575 to ~2600 bytes. Plain `stream`
+// keeps the raw map so play_video.py still works unchanged.
+//
+// Per frame, after ONE ack:
+//   u8 flags (0 raw, 1 RLE)  u16 map_len LE  map[map_len]
+// then the payload + checksum exactly as before (its own acks).
+// RLE: 0x00, n -> n zero bytes (n 1..255); any other byte is literal.
+// flags is never 0x18, so a lone CAN in its place ends the stream at once.
+static uint8_t g_rle_scratch[STREAM_BMP_BYTES];
+
+static bool stream_read_map_v2(uint8_t *bmp) {
+  Serial.write((uint8_t)0x06);
+  uint8_t hdr[3];
+  uint32_t have = 0, tw = millis(), reack = millis();
+  while (have < 3) {
+    int n = Serial.read(hdr + have, 3 - have);
+    if (n > 0) {
+      have += (uint32_t)n;
+      tw = millis();
+      if (hdr[0] == 0x18) return false;  // CAN: host stopped
+      continue;
+    }
+    if (have == 0 && (millis() - reack) > 150) {  // see stream_read_exact
+      Serial.write((uint8_t)0x06);
+      reack = millis();
+    }
+    if ((millis() - tw) > 4000) return false;
+    delay(1);
+  }
+  const uint8_t flags = hdr[0];
+  const uint32_t len = (uint32_t)hdr[1] | ((uint32_t)hdr[2] << 8);
+  if (flags > 1 || len > STREAM_BMP_BYTES || (flags == 0 && len != STREAM_BMP_BYTES))
+    return false;
+  uint8_t *dst = flags ? g_rle_scratch : bmp;
+  have = 0;
+  tw = millis();
+  while (have < len) {
+    int n = Serial.read(dst + have, len - have);
+    if (n > 0) {
+      have += (uint32_t)n;
+      tw = millis();
+    } else {
+      if ((millis() - tw) > 4000) return false;
+      delay(1);
+    }
+  }
+  if (!flags) return true;
+  uint32_t o = 0;
+  for (uint32_t i = 0; i < len; i++) {
+    uint8_t b = g_rle_scratch[i];
+    if (b) {
+      if (o >= STREAM_BMP_BYTES) return false;
+      bmp[o++] = b;
+      continue;
+    }
+    if (++i >= len) return false;
+    uint32_t run = g_rle_scratch[i] ? g_rle_scratch[i] : 1u;
+    if (o + run > STREAM_BMP_BYTES) return false;
+    memset(bmp + o, 0, run);
+    o += run;
+  }
+  return o == STREAM_BMP_BYTES;
+}
+
+static volatile bool g_stream_v2 = false;
+
 // Receive on the OTHER core, into one of two slots.
 //
 // On the sibling panel USB and the panel ran in SERIES: the link measured 4.9 fps
@@ -2445,7 +2514,8 @@ static void stream_rx_task(void *) {
   while (g_srx_run) {
     if (xSemaphoreTake(g_sem_free, pdMS_TO_TICKS(200)) != pdTRUE) continue;
     StreamSlot *s = &g_sslot[cur];
-    if (!stream_read_exact(s->bmp, STREAM_BMP_BYTES, true)) break;
+    if (g_stream_v2 ? !stream_read_map_v2(s->bmp)
+                    : !stream_read_exact(s->bmp, STREAM_BMP_BYTES, true)) break;
     s->paylen = popcount_bytes(s->bmp, STREAM_BMP_BYTES);
     if (s->paylen > PLANE_BYTES) break;
     if (!stream_read_exact(s->pay, s->paylen + 1)) break;  // payload + checksum
@@ -2497,32 +2567,72 @@ static void stream_apply(const StreamSlot *s) {
 // Composite what the panel shows: clean video, then the HUD. ImageBW is scratch
 // as far as the delta chain is concerned.
 //
-// Two tags on the top edge of the portrait canvas: MODE at the left, fps at the
-// right, size 24, each on its own tight white box (hud_text's pad) so the video
-// never runs through the glyphs. Only the two boxes are pasted over the video;
-// everything between and below them stays picture. (Was two lines at size 48,
-// stacked top-left in a whole-width strip: it sat in the letterbox band when the
-// video was fitted to width, and covered the picture once Fill reached the top.)
+// A white bar HUD_BAR px tall across the top of the portrait canvas, MODE at
+// its left end and fps at its right, size 24. The host is told the bar height
+// in the STREAM banner (hud=N) and frames the video into the area below it,
+// so no picture plays under the bar. (Was two lines at size 48 stacked
+// top-left, then two padded boxes with a sliver of video between them.)
 //
-// Rasterised into g_hud_fb only when the text changes, about once a second. Per
-// frame the boxes are copied back column by column: portrait y maps to native X
-// as 799 - y, and the buffer is column-major, so a box is one short memcpy per
-// 8-px byte column. Its y extent therefore snaps out to whole byte columns;
-// those extra rows are white in g_hud_fb, so the box grows by at most 7 px.
+// When the text changes (about once a second) it is rasterised into g_hud_fb
+// with headroom and each tag's ink box is measured there. Per frame the bar is
+// whitened and each tag pasted pixel by pixel, centred in the bar's height:
+// ~12000 pixels, well under a millisecond.
 #define HUD_SIZE 24
-#define HUD_EDGE 6            // gap between a box and the panel edge
+#define HUD_MARGIN 1          // white px between the ink and the tag's edge
+#define HUD_BAR (HUD_SIZE + 2 * HUD_MARGIN)
 static uint8_t g_hud_fb[(uint32_t)EPD_H * FB_WBYTES];
 static char g_shud_txt[24] = "";
 static bool g_shud_valid = false;
-typedef struct { int x0, y0, x1, y1; } HudBox;   // portrait, inclusive
-static HudBox g_hud_box[2];
+typedef struct { int sx0, sy0, sx1, sy1, dx0, dy0; bool on; } HudTag;
+static HudTag g_hud_tag[2];
 
-static void hud_box_paste(const HudBox &b) {
-  // Portrait y < 396 everywhere here, so no cascade-seam offset applies.
-  int c0 = (EPD_W - 1 - b.y1) / 8, c1 = (EPD_W - 1 - b.y0) / 8;
-  int r0 = b.x0 < 0 ? 0 : b.x0, r1 = b.x1 > Gate_BITS - 1 ? Gate_BITS - 1 : b.x1;
-  for (int c = c0; c <= c1; c++)
-    memcpy(ImageBW + FB_IDX(r0, c), g_hud_fb + FB_IDX(r0, c), (size_t)(r1 - r0 + 1));
+// Portrait pixel access on a raw column-major buffer, rotation 90: native
+// X = 799 - y, Y = x, MSB-first in the byte, 0 = black. Only used for y < 396,
+// so the cascade-seam offset never applies.
+static inline bool fb_black(const uint8_t *fb, int x, int y) {
+  int X = EPD_W - 1 - y;
+  return !(fb[FB_IDX(x, X >> 3)] & (uint8_t)(0x80 >> (X & 7)));
+}
+static inline void fb_put(uint8_t *fb, int x, int y, bool black) {
+  int X = EPD_W - 1 - y;
+  uint8_t *p = &fb[FB_IDX(x, X >> 3)];
+  uint8_t m = (uint8_t)(0x80 >> (X & 7));
+  if (black) *p &= (uint8_t)~m; else *p |= m;
+}
+
+// Draw `str` with its cell at (x, y) in g_hud_fb, measure the ink, and return
+// the box to paste: ink + margin, destined for the top edge, at the left or
+// right corner.
+static HudTag hud_tag(int x, int y, const char *str, bool right) {
+  HudTag t = {};
+  int w = (int)strlen(str) * (HUD_SIZE / 2);
+  EPD_ShowString((uint16_t)x, (uint16_t)y, str, HUD_SIZE, BLACK);
+  int ax = PW, ay = PH, bx = -1, by = -1;
+  for (int yy = y; yy < y + HUD_SIZE; yy++)
+    for (int xx = x; xx < x + w && xx < PW; xx++)
+      if (fb_black(g_hud_fb, xx, yy)) {
+        if (xx < ax) ax = xx;
+        if (xx > bx) bx = xx;
+        if (yy < ay) ay = yy;
+        if (yy > by) by = yy;
+      }
+  if (bx < 0) return t;
+  t.sx0 = ax - HUD_MARGIN;
+  t.sy0 = ay - HUD_MARGIN;
+  t.sx1 = bx + HUD_MARGIN;
+  t.sy1 = by + HUD_MARGIN;
+  t.dy0 = (HUD_BAR - (t.sy1 - t.sy0 + 1)) / 2;
+  if (t.dy0 < 0) t.dy0 = 0;
+  t.dx0 = right ? PW - (t.sx1 - t.sx0 + 1) : 0;
+  t.on = true;
+  return t;
+}
+
+static void hud_tag_paste(const HudTag &t) {
+  if (!t.on) return;
+  for (int y = 0; y <= t.sy1 - t.sy0; y++)
+    for (int x = 0; x <= t.sx1 - t.sx0; x++)
+      fb_put(ImageBW, t.dx0 + x, t.dy0 + y, fb_black(g_hud_fb, t.sx0 + x, t.sy0 + y));
 }
 
 static void stream_compose(void) {
@@ -2536,28 +2646,28 @@ static void stream_compose(void) {
     g_shud_valid = true;
     memset(g_hud_fb, 0xFF, sizeof(g_hud_fb));
     paint_bind(g_hud_fb);
-    const int y = HUD_EDGE + HUD_PAD;
+    // Rasterised away from the edges so the margin always has room; the
+    // paste moves each box into its corner.
+    const int pad = 4;
     char line[16];
     snprintf(line, sizeof(line), "MODE %u", (unsigned)g_wp.drive_tp);
-    int w = (int)strlen(line) * (HUD_SIZE / 2);
-    int x = HUD_EDGE + HUD_PAD;
-    hud_text(x, y, line, HUD_SIZE);
-    g_hud_box[0] = {x - HUD_PAD, y - HUD_PAD, x + w + HUD_PAD, y + HUD_SIZE + HUD_PAD};
+    g_hud_tag[0] = hud_tag(pad, pad, line, false);
     snprintf(line, sizeof(line), "%s fps", g_fps_num[0] ? g_fps_num : "--");
-    w = (int)strlen(line) * (HUD_SIZE / 2);
-    x = PW - HUD_EDGE - HUD_PAD - w;
-    hud_text(x, y, line, HUD_SIZE);
-    g_hud_box[1] = {x - HUD_PAD, y - HUD_PAD, x + w + HUD_PAD, y + HUD_SIZE + HUD_PAD};
+    int w = (int)strlen(line) * (HUD_SIZE / 2);
+    g_hud_tag[1] = hud_tag(PW - pad - w, pad, line, true);
     paint_bind(ImageBW);
   }
-  hud_box_paste(g_hud_box[0]);
-  hud_box_paste(g_hud_box[1]);
+  for (int y = 0; y < HUD_BAR; y++)
+    for (int x = 0; x < PW; x++) fb_put(ImageBW, x, y, false);
+  hud_tag_paste(g_hud_tag[0]);
+  hud_tag_paste(g_hud_tag[1]);
 }
 
 // `stream` — play until the host stops sending. Raises the baud for the duration
 // and puts it back, so the command channel stays at 115200: a firmware locked to
 // 2 Mbaud is a board you cannot talk to if the rate turns out to be unreliable.
-static void stream_run(void) {
+static void stream_run(bool v2) {
+  g_stream_v2 = v2;
   for (int i = 0; i < 2; i++) {
     if (!g_sslot[i].bmp)
       g_sslot[i].bmp = (uint8_t *)heap_caps_malloc(STREAM_BMP_BYTES, MALLOC_CAP_SPIRAM);
@@ -2586,9 +2696,13 @@ static void stream_run(void) {
   memset(g_vid, 0xFF, sizeof(g_vid));  // the host's first delta is against white
   g_shud_valid = false;                // force one rasterise at the start of a stream
 
-  Serial.printf("STREAM ready baud=%lu bmp=%u plane=%lu drive=%u panel=crow-579\n",
+  // map=rle says this is `stream2`; hud=N is the white bar's height in portrait
+  // rows, which the host leaves white so no video plays under it.
+  Serial.printf("STREAM ready baud=%lu bmp=%u plane=%lu drive=%u panel=crow-579 "
+                "map=%s hud=%d\n",
                 (unsigned long)STREAM_BAUD, (unsigned)STREAM_BMP_BYTES,
-                (unsigned long)PLANE_BYTES, (unsigned)g_wp.drive_tp);
+                (unsigned long)PLANE_BYTES, (unsigned)g_wp.drive_tp,
+                v2 ? "rle" : "raw", HUD_BAR);
   Serial.flush();
   Serial.updateBaudRate(STREAM_BAUD);
   delay(20);
@@ -2688,6 +2802,7 @@ static void print_help(void) {
   Serial.println("  field       re-seed the dithered circle field without clearing");
   Serial.println("  sweep       one bar pass top-to-bottom: normalises the background shade");
   Serial.println("  stream      play delta-encoded video from the host (raises baud to 2M)");
+  Serial.println("  stream2     same, change map RLE-compressed (Ink Flow uses this)");
   Serial.println("  bar N       sweep bar height, % of sprite box (10..200, default 80)");
   Serial.println("  spi bitbang | spi hw [MHz]   switch transport live");
   Serial.println("  flush [N]   deep de-ghost, N black/white cycles (default 3)");
@@ -2826,8 +2941,8 @@ static void handle_cmd(char *s) {
     }
     return;
   }
-  if (!strcmp(s, "stream")) {
-    stream_run();
+  if (!strcmp(s, "stream") || !strcmp(s, "stream2")) {
+    stream_run(s[6] == '2');
     return;
   }
   if (!strcmp(s, "sweep")) {

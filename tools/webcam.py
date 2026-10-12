@@ -1683,16 +1683,11 @@ def detect_panel(port, forced="auto"):
     return usb or "xiao-426"
 
 
-# Pre-rotation for the CrowPanel portrait canvas (see encode_video.image_to_fb_rot).
-# 90 showed the picture a quarter turn short as the panel is held; 0 is 90 clockwise
-# from that, judged on glass 2026-10-12.
+# Anticlockwise pre-rotation of the source before it is framed into the
+# CrowPanel's 272 x 792 portrait canvas, which reaches the glass turned 90
+# clockwise. 90 showed the picture a quarter turn short as the panel is held;
+# 0 is 90 clockwise from that, judged on glass 2026-10-12.
 CROW_ROT = 0
-
-# The portrait canvas image_to_fb_rot takes, 272 across x 792 along. Framing
-# (fill/fit, zoom, bars, mirror) is applied into this through compose_geo; it
-# is deliberately not in GEO, whose crow entry falls back to the 4.26" for the
-# preview and other xiao-shaped paths.
-CROW_CANVAS = Geo("crow-579", 272, 792, 272, 792, False)
 
 
 def open_serial_crow(port):
@@ -1710,13 +1705,56 @@ def open_serial_crow(port):
     return s
 
 
+CROW_STREAM_BAUD = 2_000_000
+HUD_RE = re.compile(rb"\bhud=(\d+)")
+
+
+def crow_reenter(s, knobs):
+    """`stream2` (RLE change map), falling back to `stream` on older firmware.
+
+    Reads the banner off the line and switches both ends to 2 Mbaud. Sets
+    knobs.crow_rle and knobs.crow_hud (white bar height the firmware draws
+    over the top of the picture, 0 if it does not say).
+    """
+    for cmd in (b"stream2\n", b"stream\n"):
+        s.baudrate = 115200
+        time.sleep(0.1)
+        s.reset_input_buffer()
+        s.write(cmd)
+        buf = b""
+        line = None
+        t0 = time.time()
+        while time.time() - t0 < 6:
+            buf += s.read(256)
+            i = buf.find(b"STREAM ready")
+            if i >= 0 and b"\n" in buf[i:]:
+                line = buf[i:buf.index(b"\n", i)]
+                break
+            if b"ERR unknown" in buf:
+                break
+        if line is None:
+            continue
+        knobs.crow_rle = b"map=rle" in line
+        m = HUD_RE.search(line)
+        knobs.crow_hud = int(m.group(1)) if m else 0
+        print(line.decode("utf-8", "replace").strip())
+        time.sleep(0.05)
+        s.baudrate = CROW_STREAM_BAUD
+        time.sleep(0.15)
+        # Drop the rate-change garbage and any acks sent while still slow; the
+        # device repeats its ack every 150 ms until data flows.
+        s.reset_input_buffer()
+        return True
+    print("device did not enter stream mode")
+    return False
+
+
 def enter_stream_crow(s, knobs):
-    from play_video import reenter_stream
-    # reenter_stream reads the banner 256 bytes at a time. With the 4 s timeout
-    # from open_serial_crow, that read sat 4 s on a ~60 byte banner while the
+    # The banner is read 256 bytes at a time. With the 4 s timeout from
+    # open_serial_crow, that read sat 4 s on a ~60 byte banner while the
     # board, already at 2 Mbaud, timed out waiting for data and fell back to
     # 115200: "STREAM done 0 frames", then a host at 2 Mbaud that never sees an
-    # ACK. Short reads here, as play_video.py itself uses.
+    # ACK. Short reads here.
     s.timeout = 0.05
     s.baudrate = 115200
     time.sleep(0.05)
@@ -1739,7 +1777,7 @@ def enter_stream_crow(s, knobs):
     if not ok:
         print("no OK drive:\n" + raw.decode("utf-8", "replace")[-300:])
         return False
-    return reenter_stream(s)
+    return crow_reenter(s, knobs)
 
 
 def leave_stream_crow(s):
@@ -1955,99 +1993,196 @@ def run_crow_loop(s, knobs, cam, should_stop=None, poll=None, ctl=None):
     and the status line never left "opening source". `poll` is the console
     key reader, for the command-line host only.
     """
-    import encode_video as crow_enc
     from play_video import send_chunked
 
-    # Tone through the same LUT and threshold builders the xiao panels use, so
-    # gray levels (2 = plain threshold, 4/16/64 = cluster dither), bias, white,
-    # black and invert all reach this panel. It used crow_enc's own gamma/
-    # contrast LUT and a fixed cluster8 matrix, so the gray selector did nothing.
-    # Rebuilt whenever a knob changes, since the GUI edits them live.
-    tone_key = None
-    lut = thresh = None
-    xmap = crow_enc.portrait_x_map()
-    prev = np.full(crow_enc.PLANE_BYTES, 0xFF, dtype=np.uint8)
+    out_q = queue.Queue(maxsize=1)
+    enc_stop = threading.Event()
+    enc = CrowEncoder(knobs, cam, int(getattr(knobs, "crow_hud", 0) or 0),
+                      bool(getattr(knobs, "crow_rle", False)))
+
+    def worker():
+        # Encode frame N+1 while frame N is on the wire, as the XIAO path does.
+        # Done in series it added 6-17 ms to every frame, and its jitter.
+        while not enc_stop.is_set():
+            item = enc.next_frame()
+            if item is None:
+                time.sleep(0.01)
+                continue
+            while not enc_stop.is_set():
+                try:
+                    out_q.put(item, timeout=0.05)
+                    break
+                except queue.Full:
+                    continue
+
+    th = threading.Thread(target=worker, name="crow-encode", daemon=True)
+    th.start()
     sent = 0
     t0 = time.time()
-    frozen = None
-    enc_bytes = 0
     win_t0, win_n = t0, 0
     why = "stop"
     s.timeout = 0.05
-    while True:
-        if should_stop is not None and should_stop():
-            break
-        act = poll() if poll is not None else None
-        if act == "quit":
-            why = "quit"
-            break
-        if act in ("rearm", "white"):
-            why = act
-            break
-        if ctl is not None:
-            if getattr(ctl, "_hold_color", None):
-                why = "hold"
+    try:
+        while True:
+            if should_stop is not None and should_stop():
                 break
-            if getattr(ctl, "_white", False) or getattr(ctl, "_rearm", False):
-                why = "white" if ctl._white else "rearm"
-                ctl._white = ctl._rearm = False
+            act = poll() if poll is not None else None
+            if act == "quit":
+                why = "quit"
                 break
-            if getattr(ctl, "_cmds", None):
-                why = "cmd"
+            if act in ("rearm", "white"):
+                why = act
                 break
-            ctl._tone = False   # tone is rebuilt from tone_key below
-        if knobs.test:
+            if act == "tone":
+                enc.skip_hold = True
+            if ctl is not None:
+                if getattr(ctl, "_hold_color", None):
+                    why = "hold"
+                    break
+                if getattr(ctl, "_white", False) or getattr(ctl, "_rearm", False):
+                    why = "white" if ctl._white else "rearm"
+                    ctl._white = ctl._rearm = False
+                    break
+                if getattr(ctl, "_cmds", None):
+                    why = "cmd"
+                    break
+                if getattr(ctl, "_tone", False):
+                    # A slider move must show at once, not be held back by
+                    # the hold threshold. Tables rebuild from the knobs.
+                    ctl._tone = False
+                    enc.skip_hold = True
+            try:
+                head, tail = out_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if not send_chunked(s, head) or not send_chunked(s, tail):
+                why = "stop" if (should_stop is not None and should_stop()) else "dead"
+                break
+            sent += 1
+            win_n += 1
+            now = time.time()
+            if ctl is not None and now - win_t0 >= 1.0:
+                ctl.fps = win_n / (now - win_t0)
+                win_t0, win_n = now, 0
+                ctl.status = ("streaming  %.1f fps  drive %d  dith %d  crow-579"
+                              % (ctl.fps, knobs.drive, int(knobs.dither)))
+            if sent % 5 == 0 and poll is not None:
+                el = max(now - t0, 0.001)
+                print("\r%d f  %5.2f fps  drive %d  %s  " %
+                      (sent, sent / el, knobs.drive, "crow-579"),
+                      end="", flush=True)
+    finally:
+        enc_stop.set()
+    return why, sent, t0
+
+
+class CrowEncoder:
+    """Source picture -> one packed CrowPanel frame, ready for the wire.
+
+    What the XIAO path already did and this panel lacked, measured on Big Buck
+    Bunny over the CH340's ~200 kB/s (median / p95 / worst wire time per
+    frame): 28 / 52 / 153 ms before, about 13 / 40 / 106 ms after.
+
+    - HOLD: a pixel keeps its last bit unless its grey moved by HOLD or more,
+      so sensor and codec noise stop flipping dither cells every frame.
+    - The change map goes RLE when the firmware takes `stream2` (map=rle).
+    - No keyframe every 60 frames (a full 30.6 KB plane, ~150 ms of wire: a
+      regular hitch). A rolling band of ROLL_BYTES is re-sent each frame
+      instead, which heals a desynchronised byte within ROLL_FRAMES frames at
+      ~2 ms of wire.
+    - The top `hud` rows stay white and the picture is framed below them, so
+      no video plays under the firmware's HUD bar.
+    """
+
+    ROLL_FRAMES = 64
+
+    def __init__(self, knobs, cam, hud, rle):
+        import encode_video as crow_enc
+        self.ce = crow_enc
+        self.knobs, self.cam = knobs, cam
+        self.hud = max(0, min(int(hud), 200))
+        self.rle = rle
+        self.xmap = crow_enc.portrait_x_map()
+        self.area = Geo("crow-area", 272, 792 - self.hud, 272, 792 - self.hud, False)
+        self.canvas = np.full((792, 272), 255, dtype=np.uint8)
+        self.prev = np.full(crow_enc.PLANE_BYTES, 0xFF, dtype=np.uint8)
+        self.prev_g = None
+        self.prev_bit = None
+        self.skip_hold = False
+        self.tone_key = None
+        self.lut = self.thresh = None
+        self.frozen = None
+        self.roll = 0
+        self.roll_bytes = -(-crow_enc.PLANE_BYTES // self.ROLL_FRAMES)
+
+    def _source(self):
+        k = self.knobs
+        if k.test:
             im = Image.new("L", (640, 360), 40)
             dr = ImageDraw.Draw(im)
             dr.rectangle((20, 20, 620, 80), fill=255)
             dr.ellipse((220, 100, 420, 300), fill=255)
-        else:
-            im = cam.latest_im if cam is not None else None
+            return im
+        im = self.cam.latest_im if self.cam is not None else None
         if im is None:
-            time.sleep(0.01)
-            continue
-        if knobs.paused:
-            if frozen is None:
-                frozen = im.copy()
-            im = frozen
-        else:
-            frozen = None
-        # Framing first, into the canvas as it will be seen, then a passthrough
-        # rot=0 placement. Before this the crow path ignored fit, zoom, pad and
-        # mirror: image_to_fb_rot always fitted to width, so Fill == Fit.
+            return None
+        if k.paused:
+            if self.frozen is None:
+                self.frozen = im.copy()
+            return self.frozen
+        self.frozen = None
+        return im
+
+    def next_frame(self):
+        """(head, tail) bytes for send_chunked, or None when no picture yet."""
+        k = self.knobs
+        im = self._source()
+        if im is None:
+            return None
         if CROW_ROT:
             im = im.rotate(CROW_ROT, expand=True)
-        im = Image.fromarray(compose_geo(im, knobs, CROW_CANVAS))
-        key = (knobs.gamma, knobs.contrast, knobs.white, knobs.black,
-               int(knobs.dither), knobs.bias, bool(knobs.invert))
-        if key != tone_key:
-            tone_key = key
-            lut = build_lut(knobs.gamma, knobs.contrast, knobs.white, knobs.black)
-            if knobs.invert:
-                lut = 255 - lut
-            thresh = build_threshold(knobs.dither, knobs.bias,
-                                     CROW_CANVAS.nh, CROW_CANVAS.nw)
-        fb = crow_enc.image_to_fb_rot(im, lut, thresh, xmap, 0)
-        bmp, pay = crow_enc.wire_frame(fb, prev, keyframe=(sent % 60 == 0))
-        if not send_chunked(s, bmp) or not send_chunked(s, pay):
-            why = "stop" if (should_stop is not None and should_stop()) else "dead"
-            break
-        prev = fb
-        sent += 1
-        win_n += 1
-        enc_bytes += len(bmp) + len(pay)
-        now = time.time()
-        if ctl is not None and now - win_t0 >= 1.0:
-            ctl.fps = win_n / (now - win_t0)
-            win_t0, win_n = now, 0
-            ctl.status = ("streaming  %.1f fps  drive %d  dith %d  crow-579"
-                          % (ctl.fps, knobs.drive, int(knobs.dither)))
-        if sent % 5 == 0 and poll is not None:
-            el = max(now - t0, 0.001)
-            print("\r%d f  %5.2f fps  drive %d  %s  " %
-                  (sent, sent / el, knobs.drive, "crow-579"),
-                  end="", flush=True)
-    return why, sent, t0
+        # Framing into the area below the HUD bar; the bar rows stay white.
+        self.canvas[self.hud:, :] = compose_geo(im, k, self.area)
+        key = (k.gamma, k.contrast, k.white, k.black, int(k.dither), k.bias,
+               bool(k.invert))
+        if key != self.tone_key:
+            self.tone_key = key
+            lut = build_lut(k.gamma, k.contrast, k.white, k.black)
+            self.lut = (255 - lut) if k.invert else lut
+            self.thresh = build_threshold(k.dither, k.bias, 792, 272)
+            self.skip_hold = True
+        g = self.lut[self.canvas]
+        bit = g >= self.thresh                       # True = white
+        if self.skip_hold:
+            self.skip_hold = False
+        elif self.prev_g is not None:
+            hold = np.abs(g.astype(np.int16) - self.prev_g.astype(np.int16)) < HOLD
+            bit = np.where(hold, self.prev_bit, bit)
+        self.prev_g, self.prev_bit = g, bit
+        # Portrait grid -> native column-major plane, as image_to_fb_rot does.
+        nat = np.zeros((272, 800), dtype=bool)      # True = black
+        nat[:, self.xmap] = ~bit.T
+        fb = np.ascontiguousarray(np.packbits(~nat, axis=1).T).reshape(-1)
+        diff = fb != self.prev
+        a = self.roll * self.roll_bytes
+        diff[a:a + self.roll_bytes] = True
+        self.roll = (self.roll + 1) % self.ROLL_FRAMES
+        self.prev = fb
+        bmp = np.packbits(diff)
+        pay = fb[diff]
+        ck = int(np.bitwise_xor.reduce(bmp)) ^ (
+            int(np.bitwise_xor.reduce(pay)) if pay.size else 0)
+        bmp_b = bmp.tobytes()
+        tail = pay.tobytes() + bytes([ck])
+        if not self.rle:
+            return bmp_b, tail
+        rle = rle_occupancy(bmp_b)
+        if len(rle) < len(bmp_b):
+            flags, occ = 1, rle
+        else:
+            flags, occ = 0, bmp_b
+        n = len(occ)
+        return bytes((flags, n & 255, (n >> 8) & 255)) + occ, tail
 
 
 def handle_key(ch, knobs):
