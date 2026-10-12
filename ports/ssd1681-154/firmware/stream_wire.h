@@ -120,9 +120,13 @@ static bool stream_recv_wire2(uint8_t *dst, const uint8_t *base, uint8_t *bmp,
                               uint8_t *lit) {
   Serial.write((uint8_t)STREAM_ACK);
   g_sw.tw = millis();  // the stall window is per frame, the cursor is not
+  // The flags byte alone first. The host's Stop is ONE CAN byte, and reading
+  // all three header bytes before looking at it sat out the full 4 s stall
+  // for the two that never come — Stop took ~4 s on every panel.
   uint8_t hdr[3];
-  if (!sw_read(hdr, 3)) return false;
+  if (!sw_byte(&hdr[0])) return false;
   if (hdr[0] == STREAM_CAN) return false;
+  if (!sw_read(hdr + 1, 2)) return false;
   const uint8_t flags = hdr[0];
   const uint16_t n_lit = (uint16_t)hdr[1] | ((uint16_t)hdr[2] << 8);
   if (n_lit > EPD_PLANE_BYTES) return false;
